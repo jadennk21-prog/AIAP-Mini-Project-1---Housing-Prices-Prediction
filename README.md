@@ -221,9 +221,9 @@ These are starting decisions, not results. The final model should be selected by
 
 The literature supports starting with a reproducible tabular-regression workflow, a simple baseline, interpretable linear models, and tree-based ensembles. For this dataset, preprocessing should treat `location_type` as nominal, scale features for scale-sensitive algorithms, and keep all learned transformations inside cross-validation pipelines. MAE is a practical primary metric, complemented by RMSE and R². Before modelling, clarify the unusual bedroom/bathroom values and confirm feature definitions. The final model choice must be based on held-out performance, residual analysis, and the intended deployment context—not on literature or correlation alone.
 
-## Exploratory Data Analysis(EDA)
+### 1. Exploratory Data Analysis(EDA)
 
-## Initial Data Exploration and Profiling 
+### 1.1 Initial Data Exploration and Profiling 
 
 ### Objective
 
@@ -256,3 +256,27 @@ The difference between the mean and median suggests right skewness, which will b
 ### Next Steps
 
 The next EDA stage will examine feature distributions, potential outliers, correlations, and relationships between predictors and the target. These findings will inform preprocessing and feature engineering decisions.
+
+### 1.2 Missing Value and Outlier Analysis
+
+The initial data-quality assessment identified no missing values or exact duplicate rows in the dataset. Consequently, no immediate missing-value imputation or duplicate-row removal is required based on these checks.
+
+Potential outliers will be investigated using the Interquartile Range (IQR) method and boxplots. The analysis will focus on extreme property prices, property sizes, and other numerical features. Observations flagged by the IQR method will not automatically be removed because they may represent legitimate properties or meaningful variation in the housing market.
+
+A potential data-quality concern involves the `number_of_bedrooms` and `number_of_bathrooms` features, which were observed to contain negative and fractional values. If these features are intended to represent actual room counts, the values may indicate data-quality issues. Their definitions and origins should be verified before any corrections are made.
+
+Overall, the dataset appears complete with respect to standard missing-value and duplicate checks, but further validation is required to establish the plausibility of individual feature values. Any treatment of outliers or suspicious records should be documented and justified before model development.
+
+## Outlier Analysis
+
+The Interquartile Range (IQR) method was applied to identify potential outliers in the numerical features. The analysis identified 54 potential outliers in `crime_rate_in_area` (5.4%), 46 in `property_size` (4.6%), 39 in `house_sale_price` (3.9%), 38 in `proximity_to_public_transport` (3.8%), and 23 in `age_of_property` (2.3%). Fewer potential outliers were detected in `number_of_bedrooms` (0.6%), `number_of_bathrooms` (0.7%), and `school_quality_score` (0.1%).
+
+These observations were flagged based on their distance from the central distribution and should not automatically be considered data errors. Extreme property prices and sizes may represent genuine market variation, while high crime-rate values may reflect real differences between areas.
+
+The analysis also raised a data-validity question because the bedroom and bathroom features contain fractional or negative values. Their definitions and possible transformations should be verified before any corrections are made.
+
+Overall, the IQR analysis provides a basis for further investigation. Outliers will be retained unless there is evidence that they are invalid, with any subsequent treatment justified by the data and evaluated during model development.
+
+
+
+
