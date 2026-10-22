@@ -1,5 +1,3 @@
-# Sprint 1 — Literature Review: House Sale Price Prediction
-
 ## 1. Project objective and problem definition
 
 This project predicts **`house_sale_price`**, a continuous numeric value, from property characteristics. Therefore, the supplied dataset represents a **supervised regression problem**, not a classification problem.
