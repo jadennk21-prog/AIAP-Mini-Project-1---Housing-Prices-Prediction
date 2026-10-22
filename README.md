@@ -220,3 +220,39 @@ These are starting decisions, not results. The final model should be selected by
 ## 10. Final conclusion
 
 The literature supports starting with a reproducible tabular-regression workflow, a simple baseline, interpretable linear models, and tree-based ensembles. For this dataset, preprocessing should treat `location_type` as nominal, scale features for scale-sensitive algorithms, and keep all learned transformations inside cross-validation pipelines. MAE is a practical primary metric, complemented by RMSE and R². Before modelling, clarify the unusual bedroom/bathroom values and confirm feature definitions. The final model choice must be based on held-out performance, residual analysis, and the intended deployment context—not on literature or correlation alone.
+
+## Exploratory Data Analysis(EDA)
+
+## Initial Data Exploration and Profiling 
+
+### Objective
+
+The initial exploratory data analysis (EDA) examines the structure, data types, completeness, and basic statistical characteristics of the housing-price dataset before preprocessing and model development.
+
+### Dataset Overview
+
+The dataset contains 1,000 observations and 9 columns, consisting of 8 predictors and the target variable `house_sale_price`.
+
+The target is continuous, so the project is treated as a supervised regression problem.
+
+### Data Quality
+
+Initial inspection found no missing values or exact duplicate rows in the supplied dataset.
+
+However, `number_of_bedrooms` and `number_of_bathrooms` contain negative and fractional values. These values require clarification because they are unusual if the features represent literal room counts.
+
+### Feature Types
+
+`location_type` is a categorical feature. The remaining columns are stored as numeric variables.
+
+The categorical feature will be investigated further to determine the appropriate encoding strategy.
+
+### Target Variable
+
+The target variable is `house_sale_price`. Its mean is approximately 350,137.92, while its median is approximately 323,881.58.
+
+The difference between the mean and median suggests right skewness, which will be investigated using distribution plots and further statistical analysis.
+
+### Next Steps
+
+The next EDA stage will examine feature distributions, potential outliers, correlations, and relationships between predictors and the target. These findings will inform preprocessing and feature engineering decisions.
