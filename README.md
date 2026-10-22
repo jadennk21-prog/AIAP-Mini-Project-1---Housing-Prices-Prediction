@@ -277,6 +277,42 @@ The analysis also raised a data-validity question because the bedroom and bathro
 
 Overall, the IQR analysis provides a basis for further investigation. Outliers will be retained unless there is evidence that they are invalid, with any subsequent treatment justified by the data and evaluated during model development.
 
+### Feature Distribution and Correlation Analysis
+
+The feature distribution analysis showed that several numerical variables have positively skewed distributions. `crime_rate_in_area` had the highest skewness (2.555), followed by `property_size` (2.020), `house_sale_price` (1.574), and `proximity_to_public_transport` (1.521). These results indicate extended upper tails in the respective distributions. In contrast, `number_of_bedrooms` (0.143) and `number_of_bathrooms` (-0.029) had skewness values close to zero, while `school_quality_score` showed moderate negative skewness (-0.529).
+
+Pearson correlation analysis identified `property_size` as the feature with the strongest positive linear association with `house_sale_price` (r = 0.708). Other positive associations were observed for `number_of_bedrooms` (r = 0.648), `school_quality_score` (r = 0.606), and `number_of_bathrooms` (r = 0.570). `crime_rate_in_area` showed a negative association (r = -0.401), as did `age_of_property` (r = -0.284). `proximity_to_public_transport` had a weaker positive association (r = 0.297).
+
+These findings suggest that property size and property characteristics may provide useful predictive information. However, pairwise correlations do not establish causation or capture every nonlinear relationship. Feature importance and incremental predictive value should be evaluated using training data during model development.
+
+The distributions and feature definitions should also be validated before transformations or corrections are applied. In particular, the possible presence of transformed values in the bedroom and bathroom features requires clarification.
+
+
+## Target Variable Analysis and Pattern Identification
+
+### 1. House Sale Price Distribution
+
+The distribution of `house_sale_price` is positively skewed, with most observations concentrated in the lower-to-middle price range and a long right tail extending toward higher prices. The mean sale price is approximately 350,138, while the median is approximately 323,882. The positive skewness of approximately 1.574 supports this observation.
+
+The boxplot identifies several potential high-price outliers, including observations exceeding 1 million. These observations should be investigated to determine whether they represent valid high-value properties or data-quality issues. They should not be removed solely because they fall outside the typical price range.
+
+### 2. Sale Price Differences by Location
+
+The group comparison shows that Rural properties have the highest mean sale price (approximately 404,179) and median sale price (approximately 362,868). Urban properties have a mean of approximately 371,063 and a median of approximately 343,212. Suburban properties have the lowest mean and median prices, at approximately 322,589 and 300,833, respectively.
+
+These results suggest an association between `location_type` and sale price in the dataset. However, differences in other property characteristics may contribute to the observed pattern, and the results do not establish a causal relationship.
+
+### 3. Relationship Between Property Size and Sale Price
+
+Sale prices increase consistently across the four property-size groups. The median sale price rises from approximately 245,962 for Small properties to approximately 442,972 for Large properties, representing an increase of approximately 80%.
+
+This pattern is consistent with the previously calculated positive Pearson correlation of approximately 0.708 between `property_size` and `house_sale_price`. Property size is therefore a strong candidate predictor for subsequent regression modelling. It should initially be retained as a continuous numerical feature to preserve information.
+
+### 4. Overall Insights
+
+The analysis identifies three useful patterns: house sale prices are positively skewed, observed sale prices differ across location categories, and larger properties tend to have higher sale prices. These findings will inform feature selection, data preprocessing, model evaluation, and the investigation of unusually expensive properties during the modelling stage.
+
+
 
 
 
