@@ -2,7 +2,8 @@
 
 This project predicts **`house_sale_price`**, a continuous numeric value, from property characteristics. Therefore, the supplied dataset represents a **supervised regression problem**, not a classification problem.
 
-> **Important clarification:** The task description uses both “classification” and “None regression.” These conflict. Since `house_sale_price` is a continuous target, this README treats the project as **regression**. If your project brief specifically requires classification, confirm the intended target with your instructor before modelling. One possible derived classification target would be whether a sale price is above or below the dataset median, but that would answer a different question and discard price magnitude.
+> **Important clarification:** The task description uses both “clas
+ification” and “None regression.” These conflict. Since `house_sale_price` is a continuous target, this README treats the project as **regression**. If your project brief specifically requires classification, confirm the intended target with your instructor before modelling. One possible derived classification target would be whether a sale price is above or below the dataset median, but that would answer a different question and discard price magnitude.
 
 The literature review informs the modelling workflow: data inspection, preprocessing, feature engineering, candidate model selection, validation, evaluation, interpretation, and limitations.
 
