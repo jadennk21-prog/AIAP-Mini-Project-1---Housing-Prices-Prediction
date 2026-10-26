@@ -160,6 +160,31 @@ def _check_robustness(res: PreprocessedData) -> Check:
     )
 
 
+def _check_imputation_report(res: PreprocessedData) -> Check:
+    """The imputation report must match the real number of missing values."""
+    cfg = res.config
+    rng = np.random.default_rng(1)
+    frame = res.raw_X_train.copy().reset_index(drop=True)
+    frame = frame.mask(rng.random(frame.shape) < 0.08)
+    num_col = cfg.log_features[0]
+    frame[num_col] = frame[num_col].astype(object)
+    frame.loc[3, num_col] = "bad text"                              # becomes NaN when coerced to a number
+    expected = {}
+    for col in frame.columns:
+        if col in cfg.categorical_features:
+            expected[col] = int(frame[col].isna().sum())
+        else:
+            expected[col] = int(pd.to_numeric(frame[col], errors="coerce").isna().sum())
+    pre = DataPreprocessor(cfg).fit(frame)
+    reported = pre.imputation_report_["n_missing"].to_dict()
+    ok = all(reported[c] == expected[c] for c in expected)
+    total = sum(expected.values())
+    return "Imputation report matches the true missing counts", ok, (
+        f"{total} missing values injected; report agrees for all {len(expected)} columns"
+        if ok else f"expected {expected}, reported {reported}"
+    )
+
+
 def _check_target(res: PreprocessedData) -> Check:
     cfg = res.config
     if res.target_transformer is None:
@@ -256,6 +281,7 @@ def run_validation(res: PreprocessedData) -> bool:
         lambda: _check_log_effect(res),
         lambda: _check_outlier_clipping(res),
         lambda: _check_robustness(res),
+        lambda: _check_imputation_report(res),
         lambda: _check_target(res),
         lambda: _check_persistence(res),
         lambda: _check_split(res),
@@ -294,6 +320,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--outlier-strategy", choices=["clip", "none"], default=d.outlier_strategy)
     p.add_argument("--outlier-iqr-factor", type=float, default=d.outlier_iqr_factor)
     p.add_argument("--target-transform", choices=["log", "boxcox", "none"], default=d.target_transform)
+    p.add_argument("--numeric-imputer", choices=["median", "mean", "constant"], default=d.numeric_imputer_strategy)
+    p.add_argument("--categorical-imputer", choices=["most_frequent", "constant"], default=d.categorical_imputer_strategy)
+    p.add_argument("--missing-indicator", action="store_true", help="add 0/1 flag columns for features with missing values")
+    p.add_argument("--feature-selection", choices=["none", "variance", "lasso"], default=d.feature_selection)
+    p.add_argument("--output-dtype", choices=["float64", "float32"], default=d.output_dtype)
     p.add_argument("--validate", action="store_true", help="run the validation suite and a baseline model")
     p.add_argument("--no-save", action="store_true", help="do not write any files")
     p.add_argument("-v", "--verbose", action="store_true")
@@ -312,6 +343,11 @@ def main(argv=None) -> int:
         outlier_strategy=args.outlier_strategy,
         outlier_iqr_factor=args.outlier_iqr_factor,
         target_transform=args.target_transform,
+        numeric_imputer_strategy=args.numeric_imputer,
+        categorical_imputer_strategy=args.categorical_imputer,
+        add_missing_indicator=args.missing_indicator,
+        feature_selection=args.feature_selection,
+        output_dtype=args.output_dtype,
     )
 
     raw = load_data(args.data)
@@ -324,6 +360,16 @@ def main(argv=None) -> int:
     print("\nCleaning report:", res.cleaning_report)
     print(f"Train: {res.X_train.shape}, Test: {res.X_test.shape}")
     print("\nOutput features:", ", ".join(res.X_train.columns))
+    pre = res.preprocessor
+    print("\nImputation report (training data):")
+    print(pre.imputation_report_.to_string())
+    if cfg.feature_selection != "none":
+        print(f"\nFeature selection ({cfg.feature_selection}) dropped: {pre.dropped_features_ or 'nothing'}")
+    print("\nDistribution of the stratification column across the split:")
+    if "stratify_column" in res.split_report:
+        print(res.split_report["stratify_column"].to_string())
+    print("\nTarget distribution in train and test:")
+    print(res.split_report["target"].to_string())
     if not res.preprocessor.outlier_bounds_.empty:
         table = res.preprocessor.outlier_bounds_.copy()
         table["train_values_clipped"] = res.preprocessor.count_clipped(res.raw_X_train)
