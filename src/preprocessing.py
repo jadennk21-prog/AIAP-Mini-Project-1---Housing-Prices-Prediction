@@ -43,15 +43,16 @@ from __future__ import annotations
 import logging
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import joblib
 import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.compose import ColumnTransformer, TransformedTargetRegressor
+from sklearn.feature_extraction import FeatureHasher
 from sklearn.feature_selection import SelectFromModel, VarianceThreshold
-from sklearn.impute import MissingIndicator, SimpleImputer
+from sklearn.impute import KNNImputer, MissingIndicator, SimpleImputer
 from sklearn.linear_model import LassoCV
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
@@ -62,6 +63,7 @@ from sklearn.preprocessing import (
     PowerTransformer,
     RobustScaler,
     StandardScaler,
+    TargetEncoder,
 )
 from sklearn.utils.validation import check_is_fitted
 
@@ -86,10 +88,14 @@ logger = logging.getLogger(__name__)
 _SCALERS = {"standard": StandardScaler, "robust": RobustScaler, "minmax": MinMaxScaler}
 _VALID_OUTLIER = ("clip", "none")
 _VALID_TARGET = ("log", "boxcox", "none")
-_VALID_NUM_IMPUTE = ("median", "mean", "constant")
+_VALID_NUM_IMPUTE = ("median", "mean", "constant", "knn")
 _VALID_CAT_IMPUTE = ("most_frequent", "constant")
 _VALID_SELECTION = ("none", "variance", "lasso")
 _VALID_DTYPE = ("float64", "float32")
+_VALID_ENCODING = ("onehot", "frequency", "hashing", "target")
+_VALID_CAT_ENCODING = (*_VALID_ENCODING, "auto")
+_VALID_HIGH_CARD = ("frequency", "hashing", "target")
+_IMPUTE_GROUPS = ("log_numeric", "numeric", "standardised")
 
 
 # --------------------------------------------------------------------------- #
@@ -113,9 +119,7 @@ class PreprocessingConfig:
         ]
     )
     #: Already z-scored in the raw data: imputed only, never rescaled again.
-    standardised_features: List[str] = field(
-        default_factory=lambda: ["number_of_bedrooms", "number_of_bathrooms"]
-    )
+    standardised_features: List[str] = field(default_factory=lambda: ["number_of_bedrooms", "number_of_bathrooms"])
     #: Remaining numeric predictors. ``None`` means "infer every other numeric column".
     numeric_features: Optional[List[str]] = None
 
@@ -126,12 +130,18 @@ class PreprocessingConfig:
     stratify_column: Optional[str] = "location_type"
 
     # Missing values
-    numeric_imputer_strategy: str = "median"          # "median", "mean" or "constant"
+    numeric_imputer_strategy: str = "median"  # "median", "mean", "constant" or "knn"
     categorical_imputer_strategy: str = "most_frequent"  # "most_frequent" or "constant"
-    numeric_fill_value: float = 0.0                   # used when the numeric strategy is "constant"
-    categorical_fill_value: str = "Missing"           # used when the categorical strategy is "constant"
+    numeric_fill_value: float = 0.0  # used when the numeric strategy is "constant"
+    categorical_fill_value: str = "Missing"  # used when the categorical strategy is "constant"
     #: Add 0/1 flag columns for every feature that had missing values in the training data.
     add_missing_indicator: bool = False
+    #: Neighbours for the "knn" strategy (columns using "knn" in the same group are imputed together).
+    knn_neighbors: int = 5
+    #: Numeric imputation strategy per column, overriding everything else: {"age_of_property": "mean"}.
+    imputer_overrides: Dict[str, str] = field(default_factory=dict)
+    #: Numeric imputation strategy per column group ("log_numeric", "numeric" or "standardised").
+    group_imputer_strategies: Dict[str, str] = field(default_factory=dict)
 
     # Outliers: "clip" winsorises features at Q1 - k*IQR / Q3 + k*IQR, "none" disables it.
     outlier_strategy: str = "clip"
@@ -140,7 +150,17 @@ class PreprocessingConfig:
     # Scaling of numeric features: "standard", "robust", "minmax" or "none"
     scaler: str = "standard"
 
-    # Encoding
+    # Categorical encoding. "onehot" suits low-cardinality columns such as location_type. For
+    # high-cardinality columns choose "frequency" (category share), "hashing" (fixed number of
+    # hashed columns) or "target" (smoothed, cross-fitted target mean; needs y in fit). "auto" picks
+    # one-hot when a column has at most max_onehot_cardinality categories in the training data and
+    # high_cardinality_encoding otherwise. encoding_overrides sets the encoding per column.
+    categorical_encoding: str = "onehot"
+    encoding_overrides: Dict[str, str] = field(default_factory=dict)
+    max_onehot_cardinality: int = 10
+    high_cardinality_encoding: str = "target"
+    hashing_n_features: int = 8
+    target_encoder_smoothing: Union[float, str] = "auto"
     drop_first_category: bool = True
 
     # Target: "log", "boxcox" or "none"
@@ -170,6 +190,28 @@ class PreprocessingConfig:
             raise ValueError(f"numeric_imputer_strategy must be one of {_VALID_NUM_IMPUTE}")
         if self.categorical_imputer_strategy not in _VALID_CAT_IMPUTE:
             raise ValueError(f"categorical_imputer_strategy must be one of {_VALID_CAT_IMPUTE}")
+        if self.categorical_encoding not in _VALID_CAT_ENCODING:
+            raise ValueError(f"categorical_encoding must be one of {_VALID_CAT_ENCODING}")
+        if self.high_cardinality_encoding not in _VALID_HIGH_CARD:
+            raise ValueError(f"high_cardinality_encoding must be one of {_VALID_HIGH_CARD}")
+        bad_enc = {c: e for c, e in self.encoding_overrides.items() if e not in _VALID_ENCODING}
+        if bad_enc:
+            raise ValueError(f"encoding_overrides contains unknown encodings {bad_enc}; choose from {_VALID_ENCODING}")
+        bad_imp = {c: v for c, v in self.imputer_overrides.items() if v not in _VALID_NUM_IMPUTE}
+        if bad_imp:
+            raise ValueError(
+                f"imputer_overrides contains unknown strategies {bad_imp}; choose from {_VALID_NUM_IMPUTE}"
+            )
+        bad_grp = [g for g in self.group_imputer_strategies if g not in _IMPUTE_GROUPS]
+        if bad_grp:
+            raise ValueError(f"group_imputer_strategies has unknown groups {bad_grp}; choose from {_IMPUTE_GROUPS}")
+        bad_grp_val = {g: v for g, v in self.group_imputer_strategies.items() if v not in _VALID_NUM_IMPUTE}
+        if bad_grp_val:
+            raise ValueError(f"group_imputer_strategies has unknown strategies {bad_grp_val}")
+        if self.knn_neighbors < 1:
+            raise ValueError("knn_neighbors must be at least 1")
+        if self.max_onehot_cardinality < 1 or self.hashing_n_features < 1:
+            raise ValueError("max_onehot_cardinality and hashing_n_features must be at least 1")
         if self.feature_selection not in _VALID_SELECTION:
             raise ValueError(f"feature_selection must be one of {_VALID_SELECTION}")
         if self.output_dtype not in _VALID_DTYPE:
@@ -193,7 +235,19 @@ class PreprocessingConfig:
             raise ValueError("The target column cannot also be a feature")
 
     def to_dict(self) -> Dict[str, Any]:
+        """JSON/YAML-friendly dictionary of every setting."""
         return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Optional[Dict[str, Any]]) -> PreprocessingConfig:
+        """Build a config from a dictionary (for example loaded from YAML), rejecting unknown keys."""
+        data = dict(data or {})
+        unknown = sorted(set(data) - set(cls.__dataclass_fields__))
+        if unknown:
+            raise ValueError(
+                f"Unknown preprocessing setting(s) {unknown}; valid settings: {sorted(cls.__dataclass_fields__)}"
+            )
+        return cls(**data)
 
 
 # --------------------------------------------------------------------------- #
@@ -281,6 +335,136 @@ class SafeLogTransformer(BaseEstimator, TransformerMixin):
     def get_feature_names_out(self, input_features=None):
         check_is_fitted(self, ["floor_"])
         return _feature_names(self, self.n_features_in_, input_features)
+
+
+class ColumnImputer(BaseEstimator, TransformerMixin):
+    """Numeric imputation with a strategy per column.
+
+    Strategies: ``median``, ``mean``, ``constant`` (``fill_value``) or ``knn``. ``strategies`` maps
+    column names to a strategy; other columns use ``default_strategy``. Columns using ``knn`` are
+    imputed together with :class:`sklearn.impute.KNNImputer`, so each of them is filled from rows that
+    are similar on the *other* knn columns (a single knn column falls back to its mean). Everything is
+    learned in ``fit``; after fitting, ``strategies_`` and ``statistics_`` describe each column
+    (``statistics_`` is NaN for knn columns).
+    """
+
+    def __init__(
+        self,
+        strategies: Optional[Dict[str, str]] = None,
+        default_strategy: str = "median",
+        fill_value: float = 0.0,
+        n_neighbors: int = 5,
+    ):
+        self.strategies = strategies
+        self.default_strategy = default_strategy
+        self.fill_value = fill_value
+        self.n_neighbors = n_neighbors
+
+    @staticmethod
+    def _array(X) -> np.ndarray:
+        arr = np.asarray(X, dtype=float)
+        return arr.reshape(-1, 1) if arr.ndim == 1 else arr
+
+    def fit(self, X, y=None):
+        arr = self._array(X)
+        names = list(X.columns) if hasattr(X, "columns") else [f"x{i}" for i in range(arr.shape[1])]
+        overrides = self.strategies or {}
+        strategies = [overrides.get(n, self.default_strategy) for n in names]
+        bad = sorted({s for s in strategies if s not in _VALID_NUM_IMPUTE})
+        if bad:
+            raise ValueError(f"Unknown imputation strategies {bad}; choose from {_VALID_NUM_IMPUTE}")
+        stats_ = np.full(arr.shape[1], np.nan)
+        for j, strategy in enumerate(strategies):
+            observed = arr[~np.isnan(arr[:, j]), j]
+            if strategy == "median":
+                stats_[j] = np.median(observed) if observed.size else 0.0
+            elif strategy == "mean":
+                stats_[j] = observed.mean() if observed.size else 0.0
+            elif strategy == "constant":
+                stats_[j] = self.fill_value
+        knn_columns = [j for j, s in enumerate(strategies) if s == "knn"]
+        self._knn_ = (
+            KNNImputer(n_neighbors=self.n_neighbors, keep_empty_features=True).fit(arr[:, knn_columns])
+            if knn_columns
+            else None
+        )
+        self.strategies_, self.statistics_, self.knn_columns_ = strategies, stats_, knn_columns
+        self.feature_names_in_ = np.asarray(names, dtype=object)
+        self.n_features_in_ = arr.shape[1]
+        return self
+
+    def transform(self, X):
+        check_is_fitted(self, ["statistics_"])
+        arr = self._array(X).copy()
+        for j, strategy in enumerate(self.strategies_):
+            if strategy != "knn":
+                arr[np.isnan(arr[:, j]), j] = self.statistics_[j]
+        if self._knn_ is not None:
+            arr[:, self.knn_columns_] = self._knn_.transform(arr[:, self.knn_columns_])
+        return arr
+
+    def get_feature_names_out(self, input_features=None):
+        check_is_fitted(self, ["statistics_"])
+        return _feature_names(self, self.n_features_in_, input_features)
+
+
+class FrequencyEncoder(BaseEstimator, TransformerMixin):
+    """Replace each category by its share of the training rows (one output column per input column).
+
+    Works for any cardinality and adds exactly one column per feature. Categories not seen in
+    training are encoded as 0.0. Different categories with the same frequency become
+    indistinguishable, which is the method's main limitation.
+    """
+
+    def fit(self, X, y=None):
+        frame = pd.DataFrame(X)
+        self.columns_ = [str(c) for c in frame.columns]
+        frame.columns = self.columns_
+        self.frequencies_ = {c: frame[c].value_counts(normalize=True, dropna=True).to_dict() for c in self.columns_}
+        self.feature_names_in_ = np.asarray(self.columns_, dtype=object)
+        self.n_features_in_ = len(self.columns_)
+        return self
+
+    def transform(self, X):
+        check_is_fitted(self, ["frequencies_"])
+        frame = pd.DataFrame(X)
+        frame.columns = self.columns_
+        out = {c: frame[c].map(self.frequencies_[c]).fillna(0.0).astype(float) for c in self.columns_}
+        return pd.DataFrame(out).to_numpy()
+
+    def get_feature_names_out(self, input_features=None):
+        check_is_fitted(self, ["frequencies_"])
+        return np.asarray([f"{c}_freq" for c in self.columns_], dtype=object)
+
+
+class HashingEncoder(BaseEstimator, TransformerMixin):
+    """Hash ``column=category`` tokens into a fixed number of count columns.
+
+    The output width (``n_features``) does not depend on the number of categories, and unseen
+    categories need no special handling. Collisions are possible by design; more buckets mean
+    fewer collisions. The hash is deterministic, so results are reproducible across runs.
+    """
+
+    def __init__(self, n_features: int = 8):
+        self.n_features = n_features
+
+    def fit(self, X, y=None):
+        frame = pd.DataFrame(X)
+        self.columns_ = [str(c) for c in frame.columns]
+        self.feature_names_in_ = np.asarray(self.columns_, dtype=object)
+        self.n_features_in_ = len(self.columns_)
+        return self
+
+    def transform(self, X):
+        check_is_fitted(self, ["columns_"])
+        frame = pd.DataFrame(X)
+        frame.columns = self.columns_
+        tokens = [[f"{c}={v}" for c, v in zip(self.columns_, row)] for row in frame.to_numpy()]
+        hasher = FeatureHasher(n_features=self.n_features, input_type="string", alternate_sign=False)
+        return hasher.transform(tokens).toarray()
+
+    def get_feature_names_out(self, input_features=None):
+        return np.asarray([f"hash_{i}" for i in range(self.n_features)], dtype=object)
 
 
 # --------------------------------------------------------------------------- #
@@ -389,9 +573,7 @@ def split_data(
     elif cfg.stratify_column:
         logger.warning("Stratify column '%s' not found; splitting without stratification", cfg.stratify_column)
 
-    return train_test_split(
-        X, y, test_size=cfg.test_size, random_state=cfg.random_state, stratify=stratify
-    )
+    return train_test_split(X, y, test_size=cfg.test_size, random_state=cfg.random_state, stratify=stratify)
 
 
 def split_distribution_report(
@@ -484,9 +666,7 @@ class DataPreprocessor(BaseEstimator, TransformerMixin):
         cfg = self._cfg
         names = [str(c).strip() for c in X.columns]
         if cfg.target in names:
-            raise ValueError(
-                f"Target column '{cfg.target}' found in the features; remove it before preprocessing"
-            )
+            raise ValueError(f"Target column '{cfg.target}' found in the features; remove it before preprocessing")
         needed = [c for c in self.numeric_columns_ + self.categorical_features_ if c in names]
         out = X.iloc[:, [names.index(c) for c in needed]].copy()
         out.columns = needed
@@ -498,16 +678,53 @@ class DataPreprocessor(BaseEstimator, TransformerMixin):
                 out[col] = pd.to_numeric(out[col], errors="coerce")
         return out
 
-    def _imputer(self, numeric: bool) -> SimpleImputer:
+    def _categorical_imputer(self) -> SimpleImputer:
         cfg = self._cfg
-        strategy = cfg.numeric_imputer_strategy if numeric else cfg.categorical_imputer_strategy
-        kwargs: Dict[str, Any] = {"strategy": strategy, "keep_empty_features": True}
-        if strategy == "constant":
-            kwargs["fill_value"] = cfg.numeric_fill_value if numeric else cfg.categorical_fill_value
+        kwargs: Dict[str, Any] = {"strategy": cfg.categorical_imputer_strategy, "keep_empty_features": True}
+        if cfg.categorical_imputer_strategy == "constant":
+            kwargs["fill_value"] = cfg.categorical_fill_value
         return SimpleImputer(**kwargs)
 
-    def _numeric_pipeline(self, cfg: PreprocessingConfig, log: bool) -> Pipeline:
-        steps = [("impute", self._imputer(numeric=True))]
+    def _numeric_imputer(self, group: str, columns: List[str]) -> ColumnImputer:
+        cfg = self._cfg
+        return ColumnImputer(
+            strategies={c: cfg.imputer_overrides[c] for c in columns if c in cfg.imputer_overrides},
+            default_strategy=cfg.group_imputer_strategies.get(group, cfg.numeric_imputer_strategy),
+            fill_value=cfg.numeric_fill_value,
+            n_neighbors=cfg.knn_neighbors,
+        )
+
+    def _encoding_plan(self, prepared: pd.DataFrame) -> Dict[str, Tuple[str, int]]:
+        """Choose an encoding for every categorical column from the training cardinality."""
+        cfg = self._cfg
+        plan = {}
+        for col in self.categorical_features_:
+            cardinality = int(prepared[col].nunique(dropna=True))
+            if col in cfg.encoding_overrides:
+                encoding = cfg.encoding_overrides[col]
+            elif cfg.categorical_encoding == "auto":
+                encoding = "onehot" if cardinality <= cfg.max_onehot_cardinality else cfg.high_cardinality_encoding
+            else:
+                encoding = cfg.categorical_encoding
+            plan[col] = (encoding, cardinality)
+        return plan
+
+    def _encoder(self, encoding: str):
+        cfg = self._cfg
+        if encoding == "onehot":
+            return OneHotEncoder(
+                handle_unknown="ignore", drop="first" if cfg.drop_first_category else None, sparse_output=False
+            )
+        if encoding == "frequency":
+            return FrequencyEncoder()
+        if encoding == "hashing":
+            return HashingEncoder(n_features=cfg.hashing_n_features)
+        return TargetEncoder(
+            target_type="continuous", smooth=cfg.target_encoder_smoothing, cv=5, random_state=cfg.random_state
+        )
+
+    def _numeric_pipeline(self, cfg: PreprocessingConfig, log: bool, group: str, columns: List[str]) -> Pipeline:
+        steps = [("impute", self._numeric_imputer(group, columns))]
         if cfg.outlier_strategy == "clip":
             steps.append(("clip", IQROutlierClipper(factor=cfg.outlier_iqr_factor)))
         if log:
@@ -517,7 +734,7 @@ class DataPreprocessor(BaseEstimator, TransformerMixin):
         return Pipeline(steps)
 
     # -- estimator API ----------------------------------------------------------
-    def fit(self, X: pd.DataFrame, y=None) -> "DataPreprocessor":
+    def fit(self, X: pd.DataFrame, y=None) -> DataPreprocessor:
         cfg = self._cfg
         cfg.validate()
         if not isinstance(X, pd.DataFrame):
@@ -538,12 +755,10 @@ class DataPreprocessor(BaseEstimator, TransformerMixin):
         if cfg.numeric_features is not None:
             self.numeric_features_ = list(cfg.numeric_features)
         else:
-            named = X.copy(deep=False)          # shallow: only the labels change, no data is copied
+            named = X.copy(deep=False)  # shallow: only the labels change, no data is copied
             named.columns = columns
             self.numeric_features_ = [
-                c
-                for c in columns
-                if c not in assigned and c != cfg.target and pd.api.types.is_numeric_dtype(named[c])
+                c for c in columns if c not in assigned and c != cfg.target and pd.api.types.is_numeric_dtype(named[c])
             ]
         self.numeric_columns_ = self.log_features_ + self.standardised_features_ + self.numeric_features_
 
@@ -556,33 +771,43 @@ class DataPreprocessor(BaseEstimator, TransformerMixin):
 
         transformers = []
         if self.log_features_:
-            transformers.append(("log_numeric", self._numeric_pipeline(cfg, log=True), self.log_features_))
-        if self.numeric_features_:
-            transformers.append(("numeric", self._numeric_pipeline(cfg, log=False), self.numeric_features_))
-        if self.standardised_features_:
-            transformers.append(
-                ("standardised", Pipeline([("impute", self._imputer(numeric=True))]), self.standardised_features_)
-            )
-        if self.categorical_features_:
             transformers.append(
                 (
-                    "categorical",
-                    Pipeline(
-                        [
-                            ("impute", self._imputer(numeric=False)),
-                            (
-                                "encode",
-                                OneHotEncoder(
-                                    handle_unknown="ignore",
-                                    drop="first" if cfg.drop_first_category else None,
-                                    sparse_output=False,
-                                ),
-                            ),
-                        ]
-                    ),
-                    self.categorical_features_,
+                    "log_numeric",
+                    self._numeric_pipeline(cfg, True, "log_numeric", self.log_features_),
+                    self.log_features_,
                 )
             )
+        if self.numeric_features_:
+            transformers.append(
+                (
+                    "numeric",
+                    self._numeric_pipeline(cfg, False, "numeric", self.numeric_features_),
+                    self.numeric_features_,
+                )
+            )
+        if self.standardised_features_:
+            transformers.append(
+                (
+                    "standardised",
+                    Pipeline([("impute", self._numeric_imputer("standardised", self.standardised_features_))]),
+                    self.standardised_features_,
+                )
+            )
+        self.encoding_plan_ = self._encoding_plan(prepared)
+        for encoding in _VALID_ENCODING:
+            cols = [c for c in self.categorical_features_ if self.encoding_plan_[c][0] == encoding]
+            if cols:
+                transformers.append(
+                    (
+                        f"categorical_{encoding}",
+                        Pipeline([("impute", self._categorical_imputer()), ("encode", self._encoder(encoding))]),
+                        cols,
+                    )
+                )
+        self.uses_target_encoding_ = any(e == "target" for e, _ in self.encoding_plan_.values())
+        if self.uses_target_encoding_ and y is None:
+            raise ValueError("Target encoding needs the target: call fit(X, y)")
         if cfg.add_missing_indicator:
             flagged = [c for c in self.numeric_columns_ + self.categorical_features_ if prepared[c].isna().any()]
             if flagged:
@@ -591,11 +816,11 @@ class DataPreprocessor(BaseEstimator, TransformerMixin):
         else:
             self.missing_flag_columns_ = []
 
-        column_transformer = ColumnTransformer(
-            transformers, remainder="drop", verbose_feature_names_out=False
-        )
+        column_transformer = ColumnTransformer(transformers, remainder="drop", verbose_feature_names_out=False)
         column_transformer.set_output(transform="pandas")
-        transformed = column_transformer.fit_transform(prepared).astype(float)
+        transformed = column_transformer.fit_transform(
+            prepared, None if y is None else np.asarray(y, dtype=float).ravel() if self.uses_target_encoding_ else None
+        ).astype(float)
 
         self.column_transformer_ = column_transformer
         self.feature_names_in_ = np.asarray(columns, dtype=object)
@@ -603,10 +828,27 @@ class DataPreprocessor(BaseEstimator, TransformerMixin):
         self.n_features_before_selection_ = transformed.shape[1]
         self._fit_feature_selection(transformed, y)
         self.feature_names_out_ = list(self.selected_features_)
+        # With target encoding the training features must be the cross-fitted ones that fit_transform
+        # produced (re-transforming the training data would leak each row's own target).
+        self._fit_output_ = (
+            transformed[self.selected_features_].astype(cfg.output_dtype) if self.uses_target_encoding_ else None
+        )
+        self.encoding_report_ = self._build_encoding_report()
         self.imputation_report_ = self._build_imputation_report(prepared)
         self._collect_fitted_summary()
         self._build_fit_summary(prepared)
         return self
+
+    def fit_transform(self, X: pd.DataFrame, y=None, **fit_params) -> pd.DataFrame:
+        """Fit and transform the training data.
+
+        Identical to ``fit(X, y).transform(X)`` except when target encoding is used: then the training
+        output comes from cross-fitting, so no row's encoding is computed from its own target.
+        """
+        self.fit(X, y)
+        if self._fit_output_ is not None:
+            return self._fit_output_.copy()
+        return self.transform(X)
 
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
         check_is_fitted(self, ["column_transformer_"])
@@ -650,9 +892,9 @@ class DataPreprocessor(BaseEstimator, TransformerMixin):
             y_arr = np.asarray(y, dtype=float).ravel()
             if len(y_arr) != len(transformed):
                 raise ValueError("X and y must have the same number of rows")
-            selector = SelectFromModel(
-                LassoCV(cv=5, max_iter=10000, random_state=cfg.random_state)
-            ).fit(transformed, y_arr)
+            selector = SelectFromModel(LassoCV(cv=5, max_iter=10000, random_state=cfg.random_state)).fit(
+                transformed, y_arr
+            )
             keep, score = selector.get_support(), np.abs(selector.estimator_.coef_)
 
         if not keep.any():
@@ -669,18 +911,46 @@ class DataPreprocessor(BaseEstimator, TransformerMixin):
             if not isinstance(pipe, Pipeline) or "impute" not in pipe.named_steps:
                 continue
             imputer = pipe.named_steps["impute"]
-            for col, fill in zip(cols, imputer.statistics_):
+            strategies = getattr(imputer, "strategies_", None) or [imputer.strategy] * len(cols)
+            for col, strategy, fill in zip(cols, strategies, imputer.statistics_):
                 n_missing = int(prepared[col].isna().sum())
                 rows.append(
                     {
                         "column": col,
                         "group": name,
-                        "strategy": imputer.strategy,
-                        "fill_value": fill,
+                        "strategy": strategy,
+                        "fill_value": "knn" if strategy == "knn" else fill,
                         "n_missing": n_missing,
                         "pct_missing": round(100 * n_missing / max(len(prepared), 1), 2),
                     }
                 )
+        return pd.DataFrame(rows).set_index("column")
+
+    def _build_encoding_report(self) -> pd.DataFrame:
+        """Per categorical column: the encoding used, training cardinality and number of output columns."""
+        rows = []
+        for name, pipe, cols in self.column_transformer_.transformers_:
+            if not isinstance(pipe, Pipeline) or "encode" not in pipe.named_steps:
+                continue
+            encoder = pipe.named_steps["encode"]
+            if isinstance(encoder, OneHotEncoder):
+                dropped = 0 if encoder.drop_idx_ is None else 1
+                widths = [max(len(categories) - dropped, 0) for categories in encoder.categories_]
+            elif isinstance(encoder, HashingEncoder):
+                widths = [encoder.n_features] * len(cols)  # all columns share the hashed output
+            else:
+                widths = [1] * len(cols)
+            for col, width in zip(cols, widths):
+                rows.append(
+                    {
+                        "column": col,
+                        "encoding": name.replace("categorical_", ""),
+                        "cardinality": self.encoding_plan_[col][1],
+                        "n_output_columns": width,
+                    }
+                )
+        if not rows:
+            return pd.DataFrame(columns=["encoding", "cardinality", "n_output_columns"])
         return pd.DataFrame(rows).set_index("column")
 
     def imputation_report(self, X: Optional[pd.DataFrame] = None) -> pd.DataFrame:
@@ -703,7 +973,7 @@ class DataPreprocessor(BaseEstimator, TransformerMixin):
 
     def _collect_fitted_summary(self) -> None:
         bounds, floors = {}, {}
-        for name, pipe, cols in self.column_transformer_.transformers_:
+        for _, pipe, cols in self.column_transformer_.transformers_:
             if not isinstance(pipe, Pipeline):
                 continue
             clip = pipe.named_steps.get("clip")
@@ -736,8 +1006,9 @@ class DataPreprocessor(BaseEstimator, TransformerMixin):
         clipped = {c: int(n) for c, n in self._count_clipped_prepared(prepared).items() if n > 0}
         n_encoded = 0
         for _, pipe, cols in self.column_transformer_.transformers_:
-            if isinstance(pipe, Pipeline) and "encode" in pipe.named_steps:
+            if isinstance(pipe, Pipeline) and isinstance(pipe.named_steps.get("encode"), OneHotEncoder):
                 n_encoded += len(pipe.named_steps["encode"].get_feature_names_out(cols))
+        encodings = {c: e for c, (e, _) in self.encoding_plan_.items()}
 
         self.fit_summary_ = {
             "n_rows": len(prepared),
@@ -749,6 +1020,7 @@ class DataPreprocessor(BaseEstimator, TransformerMixin):
             "values_clipped_per_column": clipped,
             "scaler": cfg.scaler,
             "n_one_hot_columns": n_encoded,
+            "encodings": encodings,
             "feature_selection": cfg.feature_selection,
             "dropped_features": list(self.dropped_features_),
             "n_output_features": len(self.selected_features_),
@@ -757,14 +1029,17 @@ class DataPreprocessor(BaseEstimator, TransformerMixin):
         if imputed:
             logger.info(
                 "Imputation (numeric=%s, categorical=%s): %s",
-                cfg.numeric_imputer_strategy, cfg.categorical_imputer_strategy, imputed,
+                cfg.numeric_imputer_strategy,
+                cfg.categorical_imputer_strategy,
+                imputed,
             )
         else:
             logger.info("Imputation: no missing values found in the training data")
         if cfg.outlier_strategy == "clip":
             logger.info(
                 "Outlier clipping at %.1f x IQR: %s",
-                cfg.outlier_iqr_factor, clipped if clipped else "no values outside the fences",
+                cfg.outlier_iqr_factor,
+                clipped if clipped else "no values outside the fences",
             )
         else:
             logger.info("Outlier clipping: disabled")
@@ -775,11 +1050,16 @@ class DataPreprocessor(BaseEstimator, TransformerMixin):
         if cfg.feature_selection != "none":
             logger.info(
                 "Feature selection (%s) dropped %d of %d feature(s): %s",
-                cfg.feature_selection, len(self.dropped_features_),
-                self.n_features_before_selection_, self.dropped_features_,
+                cfg.feature_selection,
+                len(self.dropped_features_),
+                self.n_features_before_selection_,
+                self.dropped_features_,
             )
-        logger.info("Output feature space: %d feature(s) from %d input column(s)",
-                    len(self.selected_features_), self.n_features_in_)
+        logger.info(
+            "Output feature space: %d feature(s) from %d input column(s)",
+            len(self.selected_features_),
+            self.n_features_in_,
+        )
 
     # -- persistence ------------------------------------------------------------
     def save(self, path: Union[str, Path]) -> Path:
@@ -791,7 +1071,7 @@ class DataPreprocessor(BaseEstimator, TransformerMixin):
         return path
 
     @staticmethod
-    def load(path: Union[str, Path]) -> "DataPreprocessor":
+    def load(path: Union[str, Path]) -> DataPreprocessor:
         """Load a preprocessor saved with :meth:`save`."""
         return joblib.load(path)
 
@@ -851,9 +1131,7 @@ class PreprocessedData:
     split_report: Dict[str, pd.DataFrame]
 
 
-def run_preprocessing(
-    df: pd.DataFrame, config: Optional[PreprocessingConfig] = None
-) -> PreprocessedData:
+def run_preprocessing(df: pd.DataFrame, config: Optional[PreprocessingConfig] = None) -> PreprocessedData:
     """Clean, split, fit the preprocessor on the training part and transform both parts."""
     cfg = config or PreprocessingConfig()
     cleaned, report = clean_data(df, cfg)
@@ -868,19 +1146,20 @@ def run_preprocessing(
         target_transformer.fit(y_train.to_frame())
         y_train_t = pd.Series(
             np.asarray(target_transformer.transform(y_train.to_frame())).ravel(),
-            index=y_train.index, name=cfg.target,
+            index=y_train.index,
+            name=cfg.target,
         )
         y_test_t = pd.Series(
             np.asarray(target_transformer.transform(y_test.to_frame())).ravel(),
-            index=y_test.index, name=cfg.target,
+            index=y_test.index,
+            name=cfg.target,
         )
 
-    preprocessor = DataPreprocessor(cfg).fit(raw_train, y_train_t)
-    X_train = preprocessor.transform(raw_train)
+    preprocessor = DataPreprocessor(cfg)
+    X_train = preprocessor.fit_transform(raw_train, y_train_t)  # cross-fitted when target encoding is used
     X_test = preprocessor.transform(raw_test)
 
-    logger.info("Preprocessed: %d train rows, %d test rows, %d features",
-                len(X_train), len(X_test), X_train.shape[1])
+    logger.info("Preprocessed: %d train rows, %d test rows, %d features", len(X_train), len(X_test), X_train.shape[1])
     return PreprocessedData(
         X_train=X_train,
         X_test=X_test,

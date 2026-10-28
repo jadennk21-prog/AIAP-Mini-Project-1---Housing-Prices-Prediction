@@ -1,0 +1,75 @@
+# Default experiment configuration (generated with: python main.py --save-config configs/default.yaml).
+# Use it with:   python main.py --config configs/default.yaml --features
+# Command-line options override anything set here. Unknown keys are rejected, so typos are caught early.
+# Sections: run, preprocessing, feature_engineering, selection, cv.
+run:
+  data: /home/claude/repo/Housing_Price_Dataset.csv
+preprocessing:
+  target: house_sale_price
+  categorical_features:
+  - location_type
+  log_features:
+  - crime_rate_in_area
+  - property_size
+  - proximity_to_public_transport
+  standardised_features:
+  - number_of_bedrooms
+  - number_of_bathrooms
+  numeric_features: null
+  drop_duplicates: true
+  test_size: 0.2
+  random_state: 42
+  stratify_column: location_type
+  numeric_imputer_strategy: median
+  categorical_imputer_strategy: most_frequent
+  numeric_fill_value: 0.0
+  categorical_fill_value: Missing
+  add_missing_indicator: false
+  knn_neighbors: 5
+  imputer_overrides: {}
+  group_imputer_strategies: {}
+  outlier_strategy: clip
+  outlier_iqr_factor: 3.0
+  scaler: standard
+  categorical_encoding: onehot
+  encoding_overrides: {}
+  max_onehot_cardinality: 10
+  high_cardinality_encoding: target
+  hashing_n_features: 8
+  target_encoder_smoothing: auto
+  drop_first_category: true
+  target_transform: log
+  feature_selection: none
+  variance_threshold: 0.0
+  output_dtype: float64
+feature_engineering:
+  roles:
+    size: property_size
+    crime: crime_rate_in_area
+    transit: proximity_to_public_transport
+    age: age_of_property
+    school: school_quality_score
+    bedrooms: number_of_bedrooms
+    bathrooms: number_of_bathrooms
+  group_prefix: location_type_
+  standardise_bases: true
+  clip_z: 3.0
+  add_composites: true
+  add_polynomial: true
+  polynomial_features: null
+  add_interactions: true
+  interaction_pairs: null
+  add_group_interactions: true
+  group_interaction_features: null
+  add_tiers: true
+  tier_features:
+  - crime_rate_in_area
+  - school_quality_score
+  n_tiers: 3
+  scale_engineered: true
+  keep_original: true
+selection:
+  method: vif
+cv:
+  folds: 5
+  repeats: 3

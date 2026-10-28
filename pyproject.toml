@@ -1,0 +1,37 @@
+[project]
+name = "housing-price-regression"
+version = "0.3.0"
+description = "EDA, preprocessing, feature engineering and evaluation pipeline for housing-price regression"
+requires-python = ">=3.9"
+
+[tool.ruff]
+line-length = 120
+target-version = "py39"
+extend-exclude = ["eda.ipynb"]
+
+[tool.ruff.lint]
+# E/F: pycodestyle and pyflakes errors, I: import order, B: likely bugs, UP: modern syntax, SIM: simplifications
+select = ["E", "F", "I", "B", "UP", "SIM", "W"]
+ignore = [
+    "UP006", "UP007", "UP035", "UP045",   # keep typing.List / Optional style (the code targets Python 3.9 and uses `from __future__ import annotations`)
+    "SIM108",                    # a plain if/else is clearer than a ternary in several places
+    "B905",                      # zip() without strict= (strict needs Python 3.10)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501", "B011", "SIM300", "E731"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["src", "main"]
+
+[tool.mypy]
+python_version = "3.10"
+files = ["src", "main.py"]
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+check_untyped_defs = true
+no_implicit_optional = true
+# scikit-learn's estimator API (attributes created in fit, **fit_params) does not fit strict typing, so the
+# checks stay lenient on untyped definitions; every function in src/ has annotations anyway.
+disallow_untyped_defs = false

@@ -1,0 +1,38 @@
+# Example showing the more advanced options. Only the settings listed here differ from the defaults.
+#   python main.py --config configs/example_advanced.yaml --features --no-save
+run:
+  data: Housing_Price_Dataset.csv
+
+preprocessing:
+  # Imputation: a strategy per column group and per column (median, mean, constant or knn).
+  numeric_imputer_strategy: median
+  group_imputer_strategies:
+    numeric: knn                 # age_of_property and school_quality_score are imputed from similar rows
+  imputer_overrides:
+    age_of_property: mean        # a single column can override its group
+  knn_neighbors: 5
+  add_missing_indicator: true    # add 0/1 flags for features that had missing values in training
+
+  # Encoding: "onehot" suits location_type. For high-cardinality columns use frequency, hashing or target
+  # encoding, or "auto" to choose by the number of categories seen in the training data.
+  categorical_encoding: auto
+  max_onehot_cardinality: 10
+  high_cardinality_encoding: target
+  encoding_overrides: {}         # e.g. {neighbourhood: hashing}
+
+  outlier_strategy: clip
+  outlier_iqr_factor: 3.0
+  scaler: standard
+  target_transform: log
+
+feature_engineering:
+  clip_z: 3.0
+  add_tiers: false               # switch feature groups on or off
+  n_tiers: 3
+
+selection:
+  method: vif+rfe                # chain methods with '+'
+
+cv:
+  folds: 5
+  repeats: 3
