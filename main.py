@@ -15,6 +15,11 @@ Engineer and select features on top of the preprocessing (saves the engineered d
 
     python main.py --features --selection-method lasso
 
+Benchmark the baseline models (a ladder from "predict the mean" to the preprocessed linear regression)::
+
+    python main.py --baseline                    # about 5 seconds
+    python main.py --baseline --candidates       # also Ridge, Lasso, trees and the engineered-feature model
+
 Compare feature sets with cross-validation (training data only) and confirm on the held-out test set::
 
     python main.py --compare-features            # about 2 minutes
@@ -71,6 +76,14 @@ from src.feature_engineering import (
     evaluate_feature_sets,
     make_full_pipeline,
     select_best_scenario,
+)
+from src.models import (
+    REFERENCE_BASELINE,
+    BaselineModel,
+    baseline_specs,
+    candidate_specs,
+    regression_metrics,
+    run_benchmark,
 )
 from src.preprocessing import (
     DataPreprocessor,
@@ -373,6 +386,53 @@ def _check_feature_pipeline(res: PreprocessedData) -> Check:
     return "Engineered + selected pipeline beats the baseline on the test set", bool(ok), detail
 
 
+def _check_metrics() -> Check:
+    """Metrics must match values worked out by hand (errors 10, -10, 30, -20 on prices 100..400)."""
+    m = regression_metrics([100.0, 200.0, 300.0, 400.0], [110.0, 190.0, 330.0, 380.0], n_features=1)
+    expected = {
+        "rmse": np.sqrt(375.0),
+        "mae": 17.5,
+        "mape": 7.5,
+        "r2": 0.97,
+        "adj_r2": 0.955,
+        "bias": 2.5,
+        "median_ae": 15.0,
+        "max_error": 30.0,
+        "within_10pct": 100.0,
+    }
+    wrong = {k: (m[k], v) for k, v in expected.items() if not np.isclose(m[k], v)}
+    return (
+        "Evaluation metrics match hand-computed values",
+        not wrong,
+        (
+            f"mismatch {wrong}"
+            if wrong
+            else f"{len(expected)} metrics checked (RMSE {m['rmse']:.3f}, MAE {m['mae']:.1f}, R2 {m['r2']:.2f})"
+        ),
+    )
+
+
+def _check_baseline_ladder(res: PreprocessedData) -> Check:
+    """The baseline ladder must be ordered: each rung is better than the one below it on the test set."""
+    specs = baseline_specs(res.config)
+    rmse = {}
+    r2 = {}
+    for name, spec in specs.items():
+        pred = spec.build().fit(res.raw_X_train, res.y_train).predict(res.raw_X_test)
+        scores = regression_metrics(res.y_test, pred)
+        rmse[name], r2[name] = scores["rmse"], scores["r2"]
+    names = list(specs)
+    floor_r2 = r2[names[0]]
+    ordered = all(rmse[names[i]] >= rmse[names[i + 1]] for i in range(1, len(names) - 1))
+    ok = abs(floor_r2) < 0.1 and ordered and rmse[REFERENCE_BASELINE] == min(rmse.values())
+    detail = " > ".join(f"{rmse[n]:,.0f}" for n in names[1:])
+    return (
+        "Baseline ladder is ordered and the mean predictor has R2 near 0",
+        bool(ok),
+        (f"mean predictor R2 = {floor_r2:.3f}; test RMSE down the ladder: {detail}"),
+    )
+
+
 def run_validation(res: PreprocessedData) -> Tuple[bool, List[Dict[str, Any]]]:
     checks: List[Callable[[], Check]] = [
         lambda: _check_output_quality(res),
@@ -390,6 +450,8 @@ def run_validation(res: PreprocessedData) -> Tuple[bool, List[Dict[str, Any]]]:
         lambda: _check_model(res),
         lambda: _check_feature_engineering(res),
         lambda: _check_feature_pipeline(res),
+        _check_metrics,
+        lambda: _check_baseline_ladder(res),
     ]
     results: List[Check] = []
     for fn in checks:
@@ -500,6 +562,88 @@ class RunPaths:
             reports=versioned_dir(args.reports_dir, run_id, on),
             reports_base=Path(args.reports_dir),
         )
+
+
+# --------------------------------------------------------------------------- #
+# Baseline benchmark
+# --------------------------------------------------------------------------- #
+def run_baseline_stage(
+    res: PreprocessedData,
+    settings: Settings,
+    paths: Optional[RunPaths],
+    recorder: RunRecorder,
+    include_candidates: bool,
+) -> Dict[str, Any]:
+    """Benchmark the baseline ladder (and optionally challengers) and describe the reference model's errors."""
+    cfg = res.config
+    specs = baseline_specs(cfg)
+    if include_candidates:
+        specs.update(candidate_specs(cfg, settings.feature_engineering, cfg.random_state))
+    result = run_benchmark(
+        res.raw_X_train,
+        res.y_train,
+        res.raw_X_test,
+        res.y_test,
+        specs,
+        n_splits=settings.cv_folds,
+        n_repeats=settings.cv_repeats,
+        random_state=cfg.random_state,
+    )
+
+    print("\n" + "=" * 78)
+    print(f"BASELINE BENCHMARK ({settings.cv_folds}-fold CV x {settings.cv_repeats} repeats on the training set)")
+    print("=" * 78)
+    cols = [
+        "rmse",
+        "mae",
+        "mape",
+        "r2",
+        "within_10pct",
+        "skill_vs_mean_%",
+        "rmse_gain_vs_reference_%",
+        "p_value_vs_reference",
+    ]
+    shown = result.comparison[cols].copy()
+    shown[["rmse", "mae"]] = shown[["rmse", "mae"]].round(0)
+    shown[["mape", "r2", "within_10pct", "skill_vs_mean_%", "rmse_gain_vs_reference_%"]] = shown[
+        ["mape", "r2", "within_10pct", "skill_vs_mean_%", "rmse_gain_vs_reference_%"]
+    ].round(3)
+    shown["p_value_vs_reference"] = shown["p_value_vs_reference"].map(lambda p: "" if pd.isna(p) else f"{p:.4f}")
+    print(shown.to_string())
+    print("\nmape and within_10pct are in percent. skill_vs_mean_% = RMSE reduction versus predicting the mean price;")
+    print("rmse_gain_vs_reference_% = RMSE reduction versus the reference (negative = worse); the p-value uses the")
+    print("corrected resampled t-test (cautious: it accounts for overlapping training sets).")
+
+    print("\nHold-out test set (each model evaluated once, after cross-validation):")
+    hold = result.holdout[["rmse", "mae", "mape", "r2", "within_10pct", "bias", "rmsle", "fit_seconds"]].copy()
+    hold[["rmse", "mae", "bias"]] = hold[["rmse", "mae", "bias"]].round(0)
+    print(hold.round(3).to_string())
+
+    ref = result.reference
+    print(f"\nWhere does the reference baseline ('{ref}') make its errors? (hold-out, residual = prediction - truth)")
+    print(result.residuals["by_price_band"].round(2).to_string())
+    if "by_group" in result.residuals:
+        print()
+        print(result.residuals["by_group"].round(2).to_string())
+    trend = result.residuals["error_trend"].iloc[0]
+    print(
+        f"\nError grows with price: the correlation of absolute error with true price is {trend.iloc[0]:.2f}; "
+        f"the most expensive fifth of homes has {trend.iloc[1]:.1f}x the MAE of the cheapest fifth."
+    )
+
+    if paths is not None:
+        written = result.save(paths.reports)
+        BaselineModel(cfg).fit(res.raw_X_train, res.y_train).save(paths.artifacts / "baseline_model.joblib")
+        print(f"\nSaved to {paths.reports}/: {', '.join(p.name for p in written.values())}")
+        print(f"Saved the fitted baseline model to {paths.artifacts}/baseline_model.joblib")
+    recorder.add("baseline", result.to_dict())
+    floor = next(n for n, s in result.specs.items() if s.tier == "floor")
+    return {
+        "baseline_cv_rmse": _num(result.cv_table.loc[ref, "rmse"]),
+        "baseline_holdout_rmse": _num(result.holdout.loc[ref, "rmse"]),
+        "baseline_holdout_r2": _num(result.holdout.loc[ref, "r2"]),
+        "mean_predictor_holdout_rmse": _num(result.holdout.loc[floor, "rmse"]),
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -732,6 +876,14 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="selection built into the preprocessor (see --selection-method for the feature-engineering stage)",
     )
     p.add_argument("--output-dtype", choices=["float64", "float32"], default=None)
+    p.add_argument(
+        "--baseline", action="store_true", help="benchmark the baseline models (mean predictor ... preprocessed linear)"
+    )
+    p.add_argument(
+        "--candidates",
+        action="store_true",
+        help="with --baseline: also benchmark Ridge, Lasso, trees and engineered features",
+    )
     p.add_argument("--features", action="store_true", help="engineer and select features after preprocessing")
     p.add_argument(
         "--selection-method",
@@ -838,6 +990,9 @@ def main(argv=None) -> int:
             saved = pre.save(paths.artifacts / "preprocessor.joblib")
         print(f"\nSaved processed data to {paths.processed}/ and the fitted preprocessor to {saved}")
 
+    if args.baseline or args.candidates:
+        with profiler.stage("baseline benchmark"):
+            summary.update(run_baseline_stage(res, settings, paths, recorder, args.candidates))
     if args.features:
         with profiler.stage("feature engineering + selection"):
             stage = run_feature_stage(res, settings, paths, recorder)

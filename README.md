@@ -1,14 +1,14 @@
 # Housing Price Regression: EDA, Preprocessing and Feature Engineering
 
 This repository contains an exploratory analysis of a housing-price dataset (`eda.ipynb`), a
-reusable, leakage-safe preprocessing pipeline built from its findings (`src/preprocessing.py`), and a
-feature engineering and selection module (`src/feature_engineering.py`) that is validated against the
-preprocessing-only baseline. Experiments are configured with version-controlled YAML/JSON files, and every
+reusable, leakage-safe preprocessing pipeline built from its findings (`src/preprocessing.py`), a ladder of
+baseline models with an evaluation framework (`src/models.py`, `src/evaluation.py`), and a feature engineering and
+selection module (`src/feature_engineering.py`) that is validated against the baseline. Experiments are configured with version-controlled YAML/JSON files, and every
 run is recorded under its own run ID (`src/experiment.py`). The regression target is `house_sale_price`.
 
 ```
-raw data -> DataPreprocessor -> FeatureEngineer -> FeatureSelector -> model
-            (preprocessing.py)   (feature_engineering.py)
+raw data -> DataPreprocessor -> FeatureEngineer -> FeatureSelector -> model -> metrics
+            (preprocessing.py)   (feature_engineering.py)          (models.py, evaluation.py)
 ```
 
 ## Quick start
@@ -17,11 +17,12 @@ raw data -> DataPreprocessor -> FeatureEngineer -> FeatureSelector -> model
 pip install -r requirements.txt          # developed and tested with Python 3.12, scikit-learn 1.8, pandas 3.0
 
 python main.py                           # preprocess the data and print what was learned
+python main.py --baseline                # benchmark the baseline models (about 5 seconds)
 python main.py --features                # add feature engineering + selection and save the results
-python main.py --validate                # run the 15-check validation suite and a baseline model
+python main.py --validate                # run the 17-check validation suite and a baseline model
 python main.py --compare-features        # cross-validated comparison of feature sets (about 3 minutes with --compare-models)
 python main.py --config configs/default.yaml --features   # run from a config file
-python -m pytest                         # run the 208 unit tests
+python -m pytest                         # run the 264 unit tests
 python main.py --help                    # every option
 ```
 
@@ -34,6 +35,8 @@ Each run that saves files writes into a folder named after its **run ID** (for e
 |---|---|
 | `--config FILE` | load a YAML/JSON experiment config; command-line options override it |
 | `--save-config FILE` | write the resolved configuration (defaults + config file + options) and exit |
+| `--baseline` | benchmark the baseline ladder (mean predictor ... preprocessed linear regression) with cross-validation and a hold-out test |
+| `--candidates` | with `--baseline`: also benchmark Ridge, Lasso, Elastic Net, random forest, gradient boosting and the engineered-feature model |
 | `--features` | engineer and select features after preprocessing |
 | `--selection-method M` | `none, variance, correlation, vif, univariate, lasso, rfe, tree, consensus`; chain with `+` (`vif+rfe`) |
 | `--compare-features` | cross-validated comparison of feature sets, then one check on the test set |
@@ -52,8 +55,8 @@ Each run that saves files writes into a folder named after its **run ID** (for e
 | Folder | Content (per run, inside `<folder>/<run_id>/`) |
 |---|---|
 | `processed/` | `X_train.csv`, `X_test.csv`, `y_train.csv`, `y_test.csv`; with `--features` also `features_X_train.csv`, `features_X_test.csv` |
-| `artifacts/` | `preprocessor.joblib`; with `--features` also `feature_pipeline.joblib` (fitted end-to-end pipeline) |
-| `reports/` | `results.json` (full run record), `config.yaml` (resolved config), `feature_catalog.csv`, `feature_selection_report.csv`; with `--compare-features` also `feature_set_comparison.csv`, `holdout_comparison.csv` |
+| `artifacts/` | `preprocessor.joblib`; with `--baseline` also `baseline_model.joblib`; with `--features` also `feature_pipeline.joblib` (fitted end-to-end pipeline) |
+| `reports/` | `results.json` (full run record), `config.yaml` (resolved config), `feature_catalog.csv`, `feature_selection_report.csv`; with `--baseline` also `baseline_cv_comparison.csv`, `baseline_holdout_metrics.csv`, `baseline_holdout_predictions.csv`, `baseline_residuals_by_price_band.csv`, `baseline_residuals_by_group.csv`, `baseline_diagnostics.png`; with `--compare-features` also `feature_set_comparison.csv`, `holdout_comparison.csv` |
 | `reports/runs.csv` | one line per run (run ID, config hash, command, key results) to list and compare runs |
 | `<folder>/latest.txt` | the ID of the newest run in that folder |
 
@@ -81,14 +84,18 @@ your-repo-name/
 ├── src/
 │   ├── __init__.py
 │   ├── preprocessing.py          # cleaning, imputation, outliers, scaling, encoding
+│   ├── models.py                 # baseline ladder, BaselineModel, candidate models, benchmark harness
+│   ├── evaluation.py             # metrics, residual diagnostics, cross-validation, model comparison test
 │   ├── feature_engineering.py    # feature creation, feature selection, feature-set evaluation
 │   └── experiment.py             # config files, run IDs, profiling, run records
 └── tests/
     ├── conftest.py               # shared fixtures (small synthetic dataset)
     ├── test_preprocessing.py     # 100 tests
     ├── test_feature_engineering.py   # 68 tests
+    ├── test_evaluation.py        # 27 tests (metrics, residual report, CV, corrected t-test)
+    ├── test_models.py            # 26 tests (baseline estimators, ladder, benchmark)
     ├── test_experiment.py        # 21 tests
-    └── test_main.py              # 19 tests (command line, config precedence, versioned outputs)
+    └── test_main.py              # 22 tests (command line, config precedence, versioned outputs, baseline run)
 ```
 
 ## Configuration files
@@ -128,8 +135,8 @@ Each run that saves files produces `reports/<run_id>/results.json`, a single mac
 - the environment (Python, platform, package versions) and a fingerprint of the data (SHA-256, rows, columns)
 - the resolved configuration and its hash
 - stage timings (and peak memory with `--profile`)
-- results: preprocessing summary, imputation and encoding reports, feature catalog and selection report, the full cross-validation
-  table **with fold-level scores**, the hold-out results and the validation checks
+- results: preprocessing summary, imputation and encoding reports, the baseline benchmark (all metrics for every fold), feature catalog and
+  selection report, the feature-set cross-validation table **with fold-level scores**, the hold-out results and the validation checks
 
 `reports/runs.csv` accumulates one summary line per run. To load a run in Python: `json.load(open("reports/<run_id>/results.json"))`.
 
@@ -184,6 +191,136 @@ Scaler: standard
 One-hot encoding created 2 column(s) from ['location_type']
 Output feature space: 9 feature(s) from 8 input column(s)
 ```
+
+## Baseline model and evaluation
+
+### What the baseline is
+
+A baseline answers "how good is a model built with almost no effort?" so that every later model has a concrete number to beat.
+`src/models.py` provides a **ladder** of baselines, from useless to sensible. All take the raw feature table and predict the price in price units.
+
+| Rung | Model | Question it answers |
+|---|---|---|
+| floor | mean price (ignores all features); median price | what if we ignore every feature? |
+| naive | mean price per `location_type` (`GroupMeanRegressor`) | what does the only categorical feature give us? |
+| naive | best single feature + straight line (`BestSingleFeatureRegressor`; it picks `property_size`) | how far does the strongest single predictor go? |
+| naive | linear regression on the raw columns | what does a model with no preprocessing achieve? |
+| **reference** | **linear regression + the project preprocessing, on log(price)** (`BaselineModel`) | **the benchmark to beat** |
+
+The reference baseline is the simplest model that uses the preprocessing decisions from the EDA (imputation, outlier capping, logs of skewed
+features, scaling, one-hot location, log target). It is fast, has no tunable hyperparameters, and is easy to interpret.
+
+### Evaluation protocol
+
+- Every model is cross-validated on the **800 training rows only** (5-fold, repeated 3 times; identical folds for all models, which is tested).
+- The **200 test rows are used once**, after cross-validation, for the final hold-out numbers.
+- All metrics are computed on the **original price scale**, so models with different internal target transforms are comparable.
+- A difference to the reference is tested with the corrected resampled t-test (the plain paired t-test is over-confident on repeated-CV folds).
+
+### Metrics and why
+
+The EDA found a right-skewed price with a few very expensive homes, so no single metric is enough. `src/evaluation.py` computes all of these
+(`metric_definitions()` returns this table as a DataFrame):
+
+| Metric | Meaning | Why it is here |
+|---|---|---|
+| **RMSE** (primary) | square root of the mean squared error | headline number in price units; dominated by the expensive homes |
+| MAE | mean absolute error | typical miss; robust to the expensive tail |
+| MAPE and within 10% | relative error; share of predictions within 10% of the true price | a 20,000 miss matters more on a cheap home; easy to explain |
+| R-squared (and adjusted) | share of price variance explained | the mean predictor scores about 0 |
+| bias | mean of (prediction - truth) | systematic over- or under-prediction, hidden by RMSE and MAE |
+| RMSLE, median AE, max error, RMSE as % of mean price, explained variance | secondary views | log-scale error, typical case, worst case |
+
+### Results
+
+Cross-validation on the training set (RMSE and MAE in price units; MAPE and within-10% in percent):
+
+| Model | CV RMSE | CV MAE | CV MAPE | CV R2 | within 10% |
+|---|---|---|---|---|---|
+| mean price | 127,173 | 95,134 | 29.9 | -0.004 | 23.5 |
+| median price | 129,371 | 92,776 | 27.1 | -0.039 | 24.2 |
+| mean price per location | 124,432 | 93,367 | 29.1 | 0.037 | 23.5 |
+| best single feature (`property_size`) | 92,441 | 68,674 | 20.8 | 0.460 | 31.6 |
+| linear regression, raw columns | 44,007 | 31,048 | 9.8 | 0.877 | 65.3 |
+| **reference: linear regression + preprocessing (log target)** | **25,149** | **17,250** | **4.9** | **0.960** | **88.6** |
+
+Hold-out test set (each model evaluated once):
+
+| Model | RMSE | MAE | MAPE | R2 | within 10% | bias |
+|---|---|---|---|---|---|---|
+| mean price | 143,441 | 101,148 | 29.0 | -0.013 | 23.0 | -16,274 |
+| mean price per location | 140,805 | 97,938 | 28.0 | 0.024 | 24.0 | -16,274 |
+| best single feature | 93,914 | 72,486 | 20.4 | 0.566 | 26.0 | -8,304 |
+| linear regression, raw columns | 51,070 | 35,082 | 9.9 | 0.872 | 65.5 | -2,540 |
+| **reference baseline** | **29,191** | **19,084** | **5.1** | **0.958** | **88.5** | **-1,141** |
+
+**Reading the numbers**
+
+- **The floor behaves as it should.** The mean predictor has R-squared near 0 (it is slightly negative on the test set, whose average price is higher than the
+  training average). Mean price per location improves it only to R-squared 0.04, which agrees with the EDA's finding that location explains a small share of price.
+- **Each rung is a real improvement.** The best single feature explains about half the variance; a plain linear regression on all raw columns reaches 0.88;
+  preprocessing and the log target take it to 0.96 and cut the cross-validated RMSE from 44,007 to 25,149 (43% lower). The share of homes predicted within 10% rises from 65% to 89%.
+- **The reference baseline predicts a typical home to within about 5%** (MAPE 5.1%, MAE 19,084 on the test set, against an average price of about 350,000).
+- **Cross-validation and the test set agree**, apart from RMSE being higher on the test set (29,191 against 25,149), which is mostly because the test set contains the most
+  expensive homes (the largest single miss is a 1.2 million home predicted at about 1.0 million).
+
+### Where the baseline makes its errors
+
+`python main.py --baseline` also prints a residual report and saves a four-panel diagnostics figure (`baseline_diagnostics.png`) for the reference model on the test set:
+
+| True-price band (test set) | mean error | mean error % | MAE |
+|---|---|---|---|
+| Q1 (cheapest fifth) | +5,288 | +2.0% | 13,536 |
+| Q2 | +5,816 | +2.1% | 15,505 |
+| Q3 | +4,916 | +1.5% | 14,264 |
+| Q4 | -3,510 | -0.8% | 16,519 |
+| Q5 (most expensive fifth) | -18,217 | -2.4% | 35,598 |
+
+- **Errors grow with price.** The most expensive fifth has 2.6 times the MAE of the cheapest fifth, and the correlation between absolute error and true price is 0.61. This is why RMSE
+  (dominated by expensive homes) is so much larger than MAE.
+- **The model shrinks towards the middle:** it over-predicts cheap homes and under-predicts expensive ones. By location the bias is small (Rural -0.8%, Suburban +0.8%, Urban +0.4%).
+- **It is not a log back-transformation problem.** I tested the standard correction (multiplying predictions by the mean of the exponentiated training residuals, "smearing"): the factor is 1.002 and
+  RMSE improves by only 0.3%. The under-prediction of expensive homes is a modelling limitation (a straight line in log space cannot capture the curvature the EDA found), which the
+  engineered features address (next section). This check is not part of the code.
+
+### Foundation for comparison and improvement
+
+`python main.py --baseline --candidates` runs the same protocol on ready-made challengers (`candidate_specs()` in `src/models.py`). These are **untuned** (default or simple settings),
+so they show the starting point for the next stage, not final results:
+
+| Challenger | CV RMSE | CV R2 | vs reference (RMSE) | hold-out RMSE |
+|---|---|---|---|---|
+| ridge (alpha 10) | 26,335 | 0.956 | 4.7% worse (p = 0.003) | 29,722 |
+| lasso (alpha 0.001) | 25,675 | 0.958 | 2.1% worse (p = 0.014) | 29,628 |
+| elastic net | 25,396 | 0.959 | 1.0% worse (p = 0.032) | 29,377 |
+| gradient boosting (defaults) | 32,775 | 0.932 | 30.3% worse (p = 0.005) | 35,721 |
+| random forest (200 trees) | 45,216 | 0.872 | 79.8% worse (p < 0.001) | 47,744 |
+| linear regression + engineered features (VIF) | 19,151 | 0.977 | **23.9% better** (p = 0.0002) | 19,397 |
+
+The main lesson is that **this reference baseline is hard to beat by changing the model alone**: regularised linear models do no better, and default tree ensembles are clearly worse. The gain comes from
+better features. To add a model, give `run_benchmark` a `BaselineSpec(name, build, description, tier)`; it will be cross-validated on identical folds and compared to the reference with the
+corrected t-test, and its results go into `results.json` automatically. Hyperparameter tuning of the challengers is the natural next step and is not part of this baseline.
+
+```python
+from src.models import BaselineModel, baseline_specs, candidate_specs, run_benchmark
+
+baseline = BaselineModel().fit(raw_X_train, y_train)
+baseline.evaluate(raw_X_test, y_test)  # dictionary of all metrics, price scale
+
+result = run_benchmark(raw_X_train, y_train, raw_X_test, y_test, baseline_specs(), n_splits=5, n_repeats=3)
+result.comparison  # CV metrics, skill vs the mean predictor, gain vs the reference, p-values
+result.holdout  # the single test-set evaluation
+result.residuals["by_price_band"]  # where the reference makes its errors
+result.save("reports/baseline")  # CSV tables, predictions and diagnostics figure
+```
+
+### Limitations of the baseline evaluation
+
+- One dataset and one random split with 200 test rows; the test-set numbers have wide uncertainty, and a handful of expensive homes move RMSE noticeably.
+  Cross-validated numbers on 800 rows are the steadier reference.
+- The reference baseline's preprocessing choices (log of three features, 3 x IQR capping, log target) came from the EDA, which looked at all 1,000 rows. That is mild but real
+  information flow from the test rows into the baseline's design.
+- The challengers are untuned, so "tree models are worse" means "with default settings on 800 rows", not "trees cannot do better".
 
 ## Feature engineering and selection
 
@@ -397,7 +534,7 @@ budget matters. These numbers come from synthetic data and show behaviour, not a
 
 ## Testing and validation
 
-**Unit tests** (`python -m pytest`, 208 tests, about 25 seconds) use a small synthetic dataset from `tests/conftest.py`
+**Unit tests** (`python -m pytest`, 264 tests, about 35 seconds) use a small synthetic dataset from `tests/conftest.py`
 so they do not depend on the real CSV. They cover:
 
 - configuration validation (invalid values and conflicting column roles are rejected)
@@ -417,20 +554,24 @@ so they do not depend on the real CSV. They cover:
 - configuration: dictionary and YAML/JSON round trips, unknown keys rejected, defaults < file < command line precedence
 - `src/experiment.py`: config hashing, run IDs (including collisions), versioned folders, JSON conversion, profiling, run record and registry
 - the command line end to end: versioned outputs, `results.json`, rerunning from a saved config, `--no-save`, `--no-versioning`
+- `src/evaluation.py`: every metric checked against hand calculations and scikit-learn, bias sign, relative-metric edge cases, input validation, the residual report
+  (errors growing with price, regression to the mean), fold-level cross-validation (refits a clone on the training part only, identical folds across models) and the corrected t-test against its formula
+- `src/models.py`: group-mean and best-single-feature estimators (unseen and messy categories, missing values), the ladder order and tiers, every baseline fitting on clean and dirty data,
+  the benchmark tables and their semantics, determinism, saving, JSON export, and `BaselineModel` save/load
 - pipelines and evaluation: price-scale predictions, missing values and unseen categories, cross-validation with selection inside,
   the corrected p-value checked against a manual calculation, the one-standard-error rule, and a curved-data test where engineering must help
 - target transforms (round trip and skew), model pipelines on the original price scale, cross-validation
   with missing values, and an end-to-end run on deliberately dirty data
 
 To check that the tests are meaningful, bugs were injected on purpose (a clipper that does not clip, a scaler that uses the
-test set's own statistics, a wrong composite formula, an engineered-feature scaler that leaks test statistics, selector protection removed, leaky target-encoding output, an ignored
+test set's own statistics, a wrong composite formula, an engineered-feature scaler that leaks test statistics, selector protection removed, a wrong-signed bias, a mis-scaled MAPE, a group-mean model without its unseen-category fallback, models evaluated on different folds, cross-validation that trains on the validation rows, leaky target-encoding output, an ignored
 per-column imputer override, run-ID collisions, a config file overriding the command line)
 and the suite failed as it should each time.
 
-**Validation script** (`python main.py --validate`) runs 15 checks on the real data and exits with a non-zero status if any fail:
+**Validation script** (`python main.py --validate`) runs 17 checks on the real data and exits with a non-zero status if any fail:
 no NaN/inf in outputs, scaling statistics, leakage, skew reduction, outlier capping, robustness to corrupted data,
 correct imputation report, reversible target transform, save/load, split proportions, cleaning, config validation, an
-end-to-end linear baseline, leak-free and deterministic feature engineering, and the engineered + selected pipeline beating the baseline on the test set. The baseline prints test R-squared of about 0.86 with a raw target and about 0.96 with the log target
+end-to-end linear baseline, leak-free and deterministic feature engineering, the engineered + selected pipeline beating the baseline on the test set, evaluation metrics matching hand-computed values, and the baseline ladder being ordered with a mean predictor near R-squared 0. The baseline prints test R-squared of about 0.86 with a raw target and about 0.96 with the log target
 (plain linear regression, seed 42). It is only a sanity check of the pipeline, not a modelling result.
 
 ## Performance notes and profiling
