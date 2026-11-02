@@ -11,6 +11,17 @@ raw data -> DataPreprocessor -> FeatureEngineer -> FeatureSelector -> model -> m
             (preprocessing.py)   (feature_engineering.py)          (models.py, evaluation.py)
 ```
 
+> **Problem type: regression.** The target, `house_sale_price`, is a continuous price, so the project uses regression metrics
+> (RMSE, MAE, MAPE, R-squared, bias), regression baselines, and cross-validation of numeric errors.
+> **Not applicable by design:** classification metrics (accuracy, precision/recall, F1, ROC-AUC), probability outputs, decision-threshold
+> tuning, class-imbalance handling (oversampling, class weights) and temporal features (the data has no dates). Stratification is used only to keep
+> `location_type` proportions equal across the splits; it is not class balancing.
+
+> **Submitting or sharing this project?** Submit the **whole repository**, not individual files: `main.py` imports five modules from `src/`
+> (`preprocessing`, `feature_engineering`, `models`, `evaluation`, `experiment`), and each one is needed. Run
+> `python scripts/verify_clean_checkout.py --zip submission.zip` first; it checks completeness and runs everything from a clean copy
+> (see [Checking that the repository is complete](#checking-that-the-repository-is-complete)).
+
 ## Quick start
 
 ```bash
@@ -18,11 +29,13 @@ pip install -r requirements.txt          # developed and tested with Python 3.12
 
 python main.py                           # preprocess the data and print what was learned
 python main.py --baseline                # benchmark the baseline models (about 5 seconds)
+python main.py --baseline --validation-size 0.1   # same, with a separate validation set (70% train / 10% validation / 20% test)
 python main.py --features                # add feature engineering + selection and save the results
 python main.py --validate                # run the 17-check validation suite and a baseline model
 python main.py --compare-features        # cross-validated comparison of feature sets (about 3 minutes with --compare-models)
 python main.py --config configs/default.yaml --features   # run from a config file
-python -m pytest                         # run the 264 unit tests
+python -m pytest                         # run the 311 unit tests
+python scripts/verify_clean_checkout.py  # prove the repository is complete: checks, then tests + validation in a clean copy
 python main.py --help                    # every option
 ```
 
@@ -44,11 +57,15 @@ Each run that saves files writes into a folder named after its **run ID** (for e
 | `--validate` | run the validation suite and a baseline model (non-zero exit code on failure) |
 | `--scaler`, `--outlier-strategy`, `--outlier-iqr-factor`, `--target-transform` | preprocessing choices |
 | `--numeric-imputer {median,mean,constant,knn}`, `--categorical-imputer`, `--missing-indicator` | imputation |
+| `--feature-selection {none,variance,lasso}` | selection built into the preprocessor (separate from `--selection-method`, which belongs to the feature-engineering stage) |
+| `--output-dtype {float64,float32}` | dtype of the processed features (`float32` halves their memory) |
 | `--categorical-encoding {onehot,frequency,hashing,target,auto}` | categorical encoding |
 | `--clip-z X`, `--cv-folds N`, `--cv-repeats N`, `--seed N`, `--test-size X` | feature engineering, evaluation and split settings (`--clip-z 0` switches winsorising off) |
 | `--data`, `--output-dir`, `--artifact-dir`, `--reports-dir` | input and output locations |
 | `--run-label TEXT`, `--no-versioning`, `--no-save` | name a run, use the flat folder layout, or write nothing |
-| `--profile`, `-v` | track peak memory per stage, print log messages (including what each fit learned) |
+| `--validation-size X` | hold out this share of all rows as a validation set (0.1 with the default test size 0.2 gives 70/10/20; default 0 = none) |
+| `--profile` | track peak Python memory per stage |
+| `-v` / `--verbose`, `-q` / `--quiet` | `--verbose`: also show INFO messages from the library modules (what each fit learned); `--quiet`: only warnings and errors (files are still written) |
 
 ### Where the outputs go
 
@@ -56,7 +73,7 @@ Each run that saves files writes into a folder named after its **run ID** (for e
 |---|---|
 | `processed/` | `X_train.csv`, `X_test.csv`, `y_train.csv`, `y_test.csv`; with `--features` also `features_X_train.csv`, `features_X_test.csv` |
 | `artifacts/` | `preprocessor.joblib`; with `--baseline` also `baseline_model.joblib`; with `--features` also `feature_pipeline.joblib` (fitted end-to-end pipeline) |
-| `reports/` | `results.json` (full run record), `config.yaml` (resolved config), `feature_catalog.csv`, `feature_selection_report.csv`; with `--baseline` also `baseline_cv_comparison.csv`, `baseline_holdout_metrics.csv`, `baseline_holdout_predictions.csv`, `baseline_residuals_by_price_band.csv`, `baseline_residuals_by_group.csv`, `baseline_diagnostics.png`; with `--compare-features` also `feature_set_comparison.csv`, `holdout_comparison.csv` |
+| `reports/` | `results.json` (full run record, including the reload checks), `run.log` (everything the run printed and logged), `config.yaml` (resolved config), `feature_catalog.csv`, `feature_selection_report.csv`; with `--baseline` also `baseline_cv_comparison.csv`, `baseline_holdout_metrics.csv`, `baseline_holdout_predictions.csv`, `baseline_residuals_by_price_band.csv`, `baseline_residuals_by_group.csv`, `baseline_diagnostics.png` (and `baseline_validation_metrics.csv` with `--validation-size`); with `--compare-features` also `feature_set_comparison.csv`, `holdout_comparison.csv` |
 | `reports/runs.csv` | one line per run (run ID, config hash, command, key results) to list and compare runs |
 | `<folder>/latest.txt` | the ID of the newest run in that folder |
 
@@ -81,6 +98,8 @@ your-repo-name/
 │   └── example_advanced.yaml     # KNN / per-column imputation, auto encoding, chained selection
 ├── examples/
 │   └── compare_encoders.py       # encoder comparison on synthetic high-cardinality data
+├── scripts/
+│   └── verify_clean_checkout.py  # completeness checks + tests and validation in a clean copy; builds the submission zip
 ├── src/
 │   ├── __init__.py
 │   ├── preprocessing.py          # cleaning, imputation, outliers, scaling, encoding
@@ -90,13 +109,70 @@ your-repo-name/
 │   └── experiment.py             # config files, run IDs, profiling, run records
 └── tests/
     ├── conftest.py               # shared fixtures (small synthetic dataset)
-    ├── test_preprocessing.py     # 100 tests
+    ├── test_preprocessing.py     # 109 tests
     ├── test_feature_engineering.py   # 68 tests
     ├── test_evaluation.py        # 27 tests (metrics, residual report, CV, corrected t-test)
-    ├── test_models.py            # 26 tests (baseline estimators, ladder, benchmark)
-    ├── test_experiment.py        # 21 tests
-    └── test_main.py              # 22 tests (command line, config precedence, versioned outputs, baseline run)
+    ├── test_models.py            # 30 tests (baseline estimators, ladder, benchmark, validation set)
+    ├── test_experiment.py        # 28 tests (config files, run IDs, profiling, reload verification)
+    ├── test_main.py              # 31 tests (command line, logging, versioned outputs, reload checks)
+    └── test_repository_integrity.py   # 18 tests (completeness, imports, README matches the code)
 ```
+
+## Data splitting and validation strategy
+
+| Setting | Rows | Used for |
+|---|---|---|
+| **Default (two-way + cross-validation)** | 800 train, 200 test | Models are compared by repeated 5-fold cross-validation **on the training rows**; the test rows are used once at the end |
+| **Optional three-way split** (`--validation-size 0.1`) | 700 train, 100 validation, 200 test | Models are fitted on the training rows and also scored on the validation rows; cross-validation on the training rows still works; the test rows are used once at the end |
+
+- **Stratification.** Both splits are stratified on `location_type`, so the small Rural group is represented equally everywhere (the three-way split
+  has exactly 50% / 40% / 10% Suburban / Urban / Rural in every part).
+- **Same test set either way.** The test rows are split off first with the same seed, so they are identical with and without a validation set
+  (tested); the validation rows are taken out of the training rows.
+- **No leakage.** Imputation values, outlier fences, log floors, scaler statistics, encoders, engineered-feature statistics and selected columns are all learned
+  from the training rows only and then applied unchanged to the validation and test rows. Inside cross-validation the whole pipeline is refitted on each training fold.
+- **Which to use?** On 1,000 rows cross-validation is the steadier way to choose between models, which is why it is the default; a separate validation
+  set is useful as an extra, independent check (and is available when a three-way split is required). Whatever you choose, decisions are made on cross-validation or validation
+  scores and the test set is reported last.
+
+Results with the three-way split (`python main.py --baseline --validation-size 0.1`, reference baseline, 700 training rows):
+cross-validated RMSE 25,490 (R-squared 0.961), **validation RMSE 21,450** (R-squared 0.960, 92% of predictions within 10%), **test RMSE 28,681** (R-squared 0.959).
+The ladder keeps the same order on the validation set (mean predictor 108,099; best single feature 91,268; raw linear regression 34,728; reference 21,450).
+The validation set has only 100 rows, so its numbers move around more than the cross-validated ones.
+
+## Saved artifacts are reloaded and checked
+
+Saving a file does not prove it can be used. After each artifact is written (`preprocessor.joblib`, `baseline_model.joblib`, `feature_pipeline.joblib`) the run reloads it from disk,
+runs it on 5 raw test rows and checks that the output is finite and **identical to the in-memory object's output**. A failed check stops the run with an
+`ArtifactVerificationError`. The outcome of every check is stored under `artifact_checks` in `results.json`, and the same helper is available as
+`src.experiment.verify_saved_artifact(path, sample, method="predict", expected=...)`.
+
+## Logging
+
+Everything the command-line program reports goes through Python's `logging` (the `main` logger, plain-message format on stdout), not `print`, so it can be silenced
+(`-q`), redirected, or captured. Each run that saves files also writes `run.log` into its report folder with timestamps, containing the program output **and** the INFO messages of the library
+modules (what each preprocessing and feature-engineering fit learned, stage timings). On the console the library messages appear on stderr with `-v`. A test checks that `main.py`
+contains no `print` calls.
+
+## Checking that the repository is complete
+
+`main.py` depends on all five modules in `src/`. A submission with only some of them cannot run, and nothing in the files you did include would tell you.
+`scripts/verify_clean_checkout.py` makes that impossible to miss:
+
+```bash
+python scripts/verify_clean_checkout.py                         # static checks, then tests + validation in a clean copy
+python scripts/verify_clean_checkout.py --quick                 # only the static checks (a second)
+python scripts/verify_clean_checkout.py --zip submission.zip    # also write a zip containing exactly the verified files
+```
+
+1. **Static checks:** every required file exists; every `from src.x import name` points at a file *and a name that is really defined there*; every third-party
+   package that is imported is listed in `requirements.txt`.
+2. **Clean copy:** the repository is copied to a temporary folder without generated outputs, caches or `.git`.
+3. **Run:** the unit tests and `main.py --validate` run inside that copy.
+
+`tests/test_repository_integrity.py` repeats the static checks inside the test suite, proves that they fail when a module, function, requirement or required file is removed,
+and keeps the documentation honest: every file in the structure tree above exists, every Python module is listed in it, every command-line option in this README exists (and every real option is
+documented), the test counts shown here equal the real test counts, and this README states that the problem is regression.
 
 ## Configuration files
 
@@ -534,7 +610,7 @@ budget matters. These numbers come from synthetic data and show behaviour, not a
 
 ## Testing and validation
 
-**Unit tests** (`python -m pytest`, 264 tests, about 35 seconds) use a small synthetic dataset from `tests/conftest.py`
+**Unit tests** (`python -m pytest`, 311 tests, about 1 minute) use a small synthetic dataset from `tests/conftest.py`
 so they do not depend on the real CSV. They cover:
 
 - configuration validation (invalid values and conflicting column roles are rejected)
@@ -552,6 +628,10 @@ so they do not depend on the real CSV. They cover:
   `n_features`, protection, consensus votes, the "needs y" error, VIF behaviour (including the main-effects regression test) and chained selectors
 - imputation options (per-column, per-group, KNN) and every categorical encoder, including a test that target-encoded training features are cross-fitted
 - configuration: dictionary and YAML/JSON round trips, unknown keys rejected, defaults < file < command line precedence
+- the optional validation set: three-way sizes, stratification, disjoint rows, identical test rows with and without it, training-only statistics, the validation table in the benchmark
+- reload verification of saved artifacts: good files, outputs that differ, wrong shapes, missing, corrupt or unusable files, NaN output, and a failing check stopping the run
+- logging: no `print` in `main.py`, `-q` silences the output, no duplicated output or leaked handlers across runs, `run.log` contents, library messages only with `-v`
+- repository integrity (see above), including tampered copies that must fail
 - `src/experiment.py`: config hashing, run IDs (including collisions), versioned folders, JSON conversion, profiling, run record and registry
 - the command line end to end: versioned outputs, `results.json`, rerunning from a saved config, `--no-save`, `--no-versioning`
 - `src/evaluation.py`: every metric checked against hand calculations and scikit-learn, bias sign, relative-metric edge cases, input validation, the residual report

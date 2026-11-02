@@ -12,6 +12,7 @@ import pytest
 
 from src.experiment import (
     CONFIG_SECTIONS,
+    ArtifactVerificationError,
     RunRecorder,
     StageProfiler,
     config_hash,
@@ -22,6 +23,7 @@ from src.experiment import (
     make_run_id,
     save_config,
     to_jsonable,
+    verify_saved_artifact,
     versioned_dir,
 )
 from src.feature_engineering import FeatureEngineeringConfig
@@ -244,3 +246,85 @@ def test_ensure_unique_run_id_avoids_existing_folders(tmp_path):
     assert ensure_unique_run_id("run", [tmp_path / "a", tmp_path / "b"]) == "run-2"
     (tmp_path / "b" / "run-2").mkdir()  # a collision in a different base folder counts too
     assert ensure_unique_run_id("run", [tmp_path / "a", tmp_path / "b"]) == "run-3"
+
+
+# --------------------------------------------------------------------------- #
+# Reload verification of saved artifacts
+# --------------------------------------------------------------------------- #
+@pytest.fixture()
+def saved_model(tmp_path):
+    import joblib
+    from sklearn.linear_model import LinearRegression
+
+    X = pd.DataFrame({"a": np.arange(20.0), "b": np.arange(20.0) ** 0.5})
+    model = LinearRegression().fit(X, 3 * X["a"] + X["b"])
+    path = tmp_path / "m.joblib"
+    joblib.dump(model, path)
+    return path, model, X
+
+
+def test_verify_accepts_a_good_artifact_and_checks_the_output(saved_model):
+    path, model, X = saved_model
+    result = verify_saved_artifact(path, X.head(5), expected=model.predict(X.head(5)))
+    assert result["ok"] is True and result["n_rows"] == 5 and result["method"] == "predict" and "error" not in result
+
+
+def test_verify_detects_output_that_differs_from_the_in_memory_model(saved_model):
+    path, model, X = saved_model
+    with pytest.raises(ArtifactVerificationError, match="differs"):
+        verify_saved_artifact(path, X.head(5), expected=model.predict(X.head(5)) + 1.0)
+    result = verify_saved_artifact(path, X.head(5), expected=model.predict(X.head(5)) + 1.0, raise_on_failure=False)
+    assert result["ok"] is False and result["max_abs_diff"] == pytest.approx(1.0)
+
+
+def test_verify_detects_a_wrong_output_shape(saved_model):
+    path, model, X = saved_model
+    with pytest.raises(ArtifactVerificationError, match="shape"):
+        verify_saved_artifact(path, X.head(5), expected=model.predict(X.head(4)))
+
+
+def test_verify_detects_missing_corrupt_and_unusable_files(saved_model, tmp_path):
+    path, _, X = saved_model
+    with pytest.raises(ArtifactVerificationError, match="could not be reloaded"):
+        verify_saved_artifact(tmp_path / "missing.joblib", X)
+    corrupt = tmp_path / "corrupt.joblib"
+    corrupt.write_bytes(b"this is not a joblib file")
+    with pytest.raises(ArtifactVerificationError):
+        verify_saved_artifact(corrupt, X)
+    with pytest.raises(ArtifactVerificationError, match="could not be reloaded"):
+        verify_saved_artifact(path, X, method="transform")  # the artifact has no transform()
+    with pytest.raises(ArtifactVerificationError):
+        verify_saved_artifact(path, X[["b"]])  # wrong input columns
+
+
+def test_verify_detects_non_finite_output(tmp_path):
+    import pickle
+
+    path = tmp_path / "broken.pkl"
+    with open(path, "wb") as handle:
+        pickle.dump(_BrokenModel(), handle)
+    with pytest.raises(ArtifactVerificationError, match="NaN"):
+        verify_saved_artifact(path, pd.DataFrame({"a": [1.0, 2.0]}))
+
+
+class _BrokenModel:
+    def predict(self, X):
+        return np.full(len(X), np.nan)
+
+
+def test_verify_works_for_transformers_returning_dataframes(tmp_path):
+    import joblib
+    from sklearn.preprocessing import StandardScaler
+
+    X = pd.DataFrame({"a": [1.0, 2.0, 3.0], "b": [2.0, 4.0, 9.0]})
+    scaler = StandardScaler().fit(X)
+    joblib.dump(scaler, tmp_path / "s.joblib")
+    assert verify_saved_artifact(tmp_path / "s.joblib", X, method="transform", expected=scaler.transform(X))["ok"]
+
+
+def test_recorder_stores_artifact_checks(config, tmp_path):
+    rec = RunRecorder("rid", config)
+    rec.add_artifact_check({"path": "a.joblib", "ok": True, "n_rows": 5})
+    rec.add_artifact_check({"path": "b.joblib", "ok": True, "n_rows": 5})
+    record = json.loads(rec.write(tmp_path).read_text())
+    assert [c["path"] for c in record["artifact_checks"]] == ["a.joblib", "b.joblib"]

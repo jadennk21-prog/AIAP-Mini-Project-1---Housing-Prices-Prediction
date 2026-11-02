@@ -343,6 +343,7 @@ class BenchmarkResult:
     reference: str
     protocol: Dict[str, Any] = field(default_factory=dict)
     fitted: Dict[str, Any] = field(default_factory=dict)
+    validation: Optional[pd.DataFrame] = None  # per model: metrics on the validation set (when one is given)
 
     def to_dict(self) -> Dict[str, Any]:
         """JSON-friendly summary for the run record (fold-level metrics included)."""
@@ -352,6 +353,7 @@ class BenchmarkResult:
             "models": {n: {"tier": s.tier, "description": s.description} for n, s in self.specs.items()},
             "comparison": self.comparison,
             "holdout": self.holdout,
+            "validation": self.validation,
             "fold_metrics": {n: f.to_dict(orient="list") for n, f in self.fold_metrics.items()},
             "reference_residuals": self.residuals,
         }
@@ -370,6 +372,9 @@ class BenchmarkResult:
         self.holdout.to_csv(written["holdout"])
         self.predictions.to_csv(written["predictions"], index_label="row_id")
         self.residuals["by_price_band"].to_csv(written["by_price_band"])
+        if self.validation is not None:
+            written["validation"] = directory / "baseline_validation_metrics.csv"
+            self.validation.to_csv(written["validation"])
         if "by_group" in self.residuals:
             written["by_group"] = directory / "baseline_residuals_by_group.csv"
             self.residuals["by_group"].to_csv(written["by_group"])
@@ -402,6 +407,8 @@ def run_benchmark(
     n_repeats: int = 3,
     random_state: int = 42,
     group_column: Optional[str] = "location_type",
+    X_val: Optional[pd.DataFrame] = None,
+    y_val: Optional[pd.Series] = None,
 ) -> BenchmarkResult:
     """Cross-validate every model on the training set, then evaluate each once on the test set.
 
@@ -409,7 +416,12 @@ def run_benchmark(
     metric, the **RMSE improvement over the mean predictor** (``skill_vs_mean_%``) and **over the reference
     baseline** (``rmse_gain_vs_reference_%``, positive = better) with the corrected resampled t-test p-value.
     ``holdout`` holds the single test-set evaluation. The residual report describes the reference model.
+    When a validation set is given (``X_val``, ``y_val``) every model, fitted on the training rows, is also
+    scored on it (``validation``); use that, or the cross-validation, for choosing between models and keep the
+    test set for the final report.
     """
+    if (X_val is None) != (y_val is None):
+        raise ValueError("X_val and y_val must be given together")
     specs = specs if specs is not None else baseline_specs()
     if reference not in specs:
         raise ValueError(f"Reference model '{reference}' is not among the models: {list(specs)}")
@@ -419,6 +431,7 @@ def run_benchmark(
 
     fold_metrics: Dict[str, pd.DataFrame] = {}
     holdout_rows: Dict[str, Dict[str, float]] = {}
+    validation_rows: Dict[str, Dict[str, float]] = {}
     predictions = pd.DataFrame({"true": np.asarray(y_test, dtype=float)}, index=X_test.index)
     fitted: Dict[str, Any] = {}
     for name, spec in specs.items():
@@ -433,6 +446,8 @@ def run_benchmark(
         pred = np.asarray(model.predict(X_test), dtype=float)
         predictions[name] = pred
         holdout_rows[name] = {**regression_metrics(y_test, pred, n_features), "fit_seconds": fit_seconds}
+        if X_val is not None and y_val is not None:
+            validation_rows[name] = regression_metrics(y_val, np.asarray(model.predict(X_val), dtype=float), n_features)
         fitted[name] = model
 
     cv_table = pd.DataFrame({n: _summarise_folds(f) for n, f in fold_metrics.items()}).T
@@ -471,8 +486,10 @@ def run_benchmark(
             "random_state": random_state,
             "n_train": len(X_train),
             "n_test": len(X_test),
+            "n_validation": 0 if X_val is None else len(X_val),
             "primary_metric": PRIMARY_METRIC,
             "higher_is_better": list(HIGHER_IS_BETTER),
         },
         fitted=fitted,
+        validation=pd.DataFrame(validation_rows).T if validation_rows else None,
     )

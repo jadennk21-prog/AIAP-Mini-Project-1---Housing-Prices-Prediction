@@ -743,3 +743,76 @@ def test_target_encoding_inside_a_model_pipeline_and_cv(high_card_df):
 def test_default_encoding_is_unchanged_one_hot(fitted):
     assert fitted.encoding_plan_ == {"location_type": ("onehot", 3)}
     assert {"location_type_Suburban", "location_type_Urban"} <= set(fitted.feature_names_out_)
+
+
+# --------------------------------------------------------------------------- #
+# Optional validation set (train / validation / test)
+# --------------------------------------------------------------------------- #
+from src.preprocessing import split_data_three_way  # noqa: E402
+
+
+@pytest.mark.parametrize("kwargs", [{"validation_size": -0.1}, {"validation_size": 1.0}, {"validation_size": 0.85}])
+def test_validation_size_is_validated(kwargs):
+    with pytest.raises(ValueError):
+        PreprocessingConfig(**kwargs)
+
+
+def test_three_way_split_sizes_stratification_and_disjointness(raw_df):
+    cfg = PreprocessingConfig(validation_size=0.1)
+    cleaned, _ = clean_data(raw_df, cfg)
+    X_train, X_val, X_test, y_train, y_val, y_test = split_data_three_way(cleaned, cfg)
+    assert (len(X_train), len(X_val), len(X_test)) == (350, 50, 100)  # 70% / 10% / 20% of 500
+    assert len(y_train) == len(X_train) and len(y_val) == len(X_val) and len(y_test) == len(X_test)
+    assert not (set(X_train.index) & set(X_val.index)) and not (set(X_train.index) & set(X_test.index))
+    assert not (set(X_val.index) & set(X_test.index))
+    assert set(X_train.index) | set(X_val.index) | set(X_test.index) == set(cleaned.index)
+    shares = {
+        name: part["location_type"].value_counts(normalize=True)
+        for name, part in (("train", X_train), ("val", X_val), ("test", X_test))
+    }
+    assert (shares["train"] - shares["val"]).abs().max() < 0.03 and (
+        shares["train"] - shares["test"]
+    ).abs().max() < 0.03
+
+
+def test_test_rows_are_identical_with_and_without_a_validation_set(raw_df):
+    two = PreprocessingConfig()
+    three = PreprocessingConfig(validation_size=0.1)
+    cleaned, _ = clean_data(raw_df, two)
+    _, test_two, _, _ = split_data(cleaned, two)
+    _, _, test_three, _, _, _ = split_data_three_way(cleaned, three)
+    assert test_two.index.equals(test_three.index)
+
+
+def test_three_way_split_is_reproducible_and_needs_a_validation_size(raw_df):
+    cfg = PreprocessingConfig(validation_size=0.1)
+    cleaned, _ = clean_data(raw_df, cfg)
+    a, b = split_data_three_way(cleaned, cfg), split_data_three_way(cleaned, cfg)
+    for left, right in zip(a, b):
+        assert left.index.equals(right.index)
+    with pytest.raises(ValueError, match="greater than 0"):
+        split_data_three_way(cleaned, PreprocessingConfig())
+
+
+def test_run_preprocessing_without_validation_has_no_validation_data(raw_df):
+    res = run_preprocessing(raw_df, PreprocessingConfig())
+    assert res.X_val is None and res.raw_X_val is None and res.y_val is None and res.y_val_transformed is None
+    assert "validation" not in res.split_report["target"].columns
+
+
+def test_run_preprocessing_with_validation_transforms_it_with_training_statistics(raw_df):
+    cfg = PreprocessingConfig(validation_size=0.1)
+    res = run_preprocessing(raw_df, cfg)
+    assert (len(res.X_train), len(res.X_val), len(res.X_test)) == (350, 50, 100)
+    assert list(res.X_val.columns) == list(res.X_train.columns) and not res.X_val.isna().any().any()
+    assert res.y_val_transformed is not None and np.allclose(np.exp(res.y_val_transformed), res.y_val)
+    refit = DataPreprocessor(cfg).fit(res.raw_X_train)  # statistics from the training rows only
+    pd.testing.assert_frame_equal(refit.transform(res.raw_X_val), res.X_val)
+    assert abs(res.X_val["age_of_property"].mean()) > 1e-6  # not re-centred on the validation set
+
+
+def test_split_report_includes_the_validation_set(raw_df):
+    res = run_preprocessing(raw_df, PreprocessingConfig(validation_size=0.1))
+    table = res.split_report["stratify_column"]
+    assert table["val_n"].sum() == 50 and {"val_n", "val_%", "gap_points"} <= set(table.columns)
+    assert "validation" in res.split_report["target"].columns

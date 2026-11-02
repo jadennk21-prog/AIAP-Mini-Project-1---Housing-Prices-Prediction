@@ -204,4 +204,139 @@ def test_validation_run_records_checks(tmp_path):
     assert main.main(["--validate", *dirs(tmp_path)]) == 0
     run_id = (tmp_path / "reports" / "latest.txt").read_text().strip()
     record = json.loads((tmp_path / "reports" / run_id / "results.json").read_text())
-    assert record["validation"]["passed"] is True and len(record["validation"]["checks"]) == 15
+    assert record["validation"]["passed"] is True and len(record["validation"]["checks"]) == 17
+
+
+@needs_data
+def test_baseline_run_writes_tables_plot_model_and_record(tmp_path, capsys):
+    assert main.main(["--baseline", *dirs(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    assert "BASELINE BENCHMARK" in out and "Error grows with price" in out
+    run_id = (tmp_path / "reports" / "latest.txt").read_text().strip()
+    report_dir = tmp_path / "reports" / run_id
+    for name in (
+        "baseline_cv_comparison.csv",
+        "baseline_holdout_metrics.csv",
+        "baseline_holdout_predictions.csv",
+        "baseline_residuals_by_price_band.csv",
+        "baseline_residuals_by_group.csv",
+        "baseline_diagnostics.png",
+    ):
+        assert (report_dir / name).exists(), name
+    assert (tmp_path / "artifacts" / run_id / "baseline_model.joblib").exists()
+    record = json.loads((report_dir / "results.json").read_text())
+    assert record["baseline"]["reference"] == "linear regression + preprocessing (log target)"
+    assert len(record["baseline"]["fold_metrics"]["mean price (ignores all features)"]["rmse"]) == 15
+    registry = (tmp_path / "reports" / "runs.csv").read_text()
+    assert "baseline_holdout_rmse" in registry and "mean_predictor_holdout_rmse" in registry
+
+
+@needs_data
+def test_baseline_no_save_and_candidates(tmp_path, capsys):
+    assert main.main(["--baseline", "--candidates", "--cv-folds", "3", "--cv-repeats", "1", "--no-save"]) == 0
+    out = capsys.readouterr().out
+    assert "random forest + preprocessing" in out and "engineered features (VIF)" in out
+    assert not (tmp_path / "reports").exists()
+
+
+@needs_data
+def test_baseline_results_are_the_documented_numbers(capsys):
+    """Guards the figures quoted in the README (seed 42, 5-fold x 3 repeats, 800 / 200 split)."""
+    assert main.main(["--baseline", "--no-save"]) == 0
+    out = capsys.readouterr().out
+    assert "29191.0" in out or "29191" in out  # reference hold-out RMSE
+    assert "143441" in out  # mean predictor hold-out RMSE
+
+
+# --------------------------------------------------------------------------- #
+# Logging, validation split and reload checks in the command line
+# --------------------------------------------------------------------------- #
+def test_main_py_never_calls_print():
+    import ast
+
+    tree = ast.parse((Path(main.ROOT) / "main.py").read_text())
+    prints = [n.lineno for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "print"]
+    assert prints == []
+
+
+@needs_data
+def test_quiet_silences_the_program_output_but_still_writes_files(tmp_path, capsys):
+    assert main.main(["--quiet", "--baseline", *dirs(tmp_path)]) == 0
+    assert capsys.readouterr().out == ""
+    run_id = (tmp_path / "reports" / "latest.txt").read_text().strip()
+    assert (tmp_path / "reports" / run_id / "results.json").exists()
+
+
+@needs_data
+def test_default_output_goes_to_stdout_through_the_logger(capsys):
+    assert main.main(["--no-save"]) == 0
+    out = capsys.readouterr().out
+    assert "Loaded 1000 rows x 9 columns" in out and "Stage timings" in out
+
+
+@needs_data
+def test_repeated_runs_do_not_duplicate_output_or_leak_handlers(capsys):
+    import logging
+
+    main.main(["--no-save"])
+    first = capsys.readouterr().out
+    main.main(["--no-save"])
+    second = capsys.readouterr().out
+    assert first.count("Loaded 1000 rows") == 1 and second.count("Loaded 1000 rows") == 1
+    assert not any(getattr(h, main._HANDLER_TAG, False) for h in logging.getLogger().handlers + main.logger.handlers)
+
+
+@needs_data
+def test_run_log_is_written_with_program_output_and_library_messages(tmp_path):
+    main.main(["--baseline", *dirs(tmp_path)])
+    run_id = (tmp_path / "reports" / "latest.txt").read_text().strip()
+    log = (tmp_path / "reports" / run_id / "run.log").read_text()
+    assert "main: Run ID:" in log and "main: Loaded 1000 rows x 9 columns" in log
+    assert "src.preprocessing: Loaded 1000 rows" in log and "src.experiment: Stage 'preprocessing' took" in log
+
+
+@needs_data
+def test_library_messages_appear_on_stderr_only_with_verbose(capsys):
+    main.main(["--no-save"])
+    assert "INFO:" not in capsys.readouterr().err
+    main.main(["--no-save", "--verbose"])
+    assert "INFO: Loaded 1000 rows" in capsys.readouterr().err
+
+
+@needs_data
+def test_validation_size_gives_a_70_10_20_split_end_to_end(tmp_path, capsys):
+    assert main.main(["--baseline", "--validation-size", "0.1", *dirs(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    assert "Train: (700, 9), Test: (200, 9)" in out and "Validation set (100 rows" in out
+    run_id = (tmp_path / "reports" / "latest.txt").read_text().strip()
+    record = json.loads((tmp_path / "reports" / run_id / "results.json").read_text())
+    assert record["baseline"]["protocol"]["n_validation"] == 100 and record["baseline"]["validation"] is not None
+    assert record["config"]["preprocessing"]["validation_size"] == 0.1
+    assert (tmp_path / "reports" / run_id / "baseline_validation_metrics.csv").exists()
+    assert (tmp_path / "processed" / run_id / "X_train.csv").read_text().count("\n") == 701
+
+
+@needs_data
+def test_saved_artifacts_are_reloaded_and_verified(tmp_path, capsys):
+    assert main.main(["--baseline", "--features", *dirs(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    for name in ("preprocessor.joblib", "baseline_model.joblib", "feature_pipeline.joblib"):
+        assert f"Reload check passed: {name}" in out
+    run_id = (tmp_path / "reports" / "latest.txt").read_text().strip()
+    record = json.loads((tmp_path / "reports" / run_id / "results.json").read_text())
+    checks = {Path(c["path"]).name: c for c in record["artifact_checks"]}
+    assert set(checks) == {"preprocessor.joblib", "baseline_model.joblib", "feature_pipeline.joblib"}
+    assert all(c["ok"] and c["n_rows"] == 5 for c in checks.values())
+
+
+@needs_data
+def test_a_failing_reload_check_stops_the_run(tmp_path, monkeypatch):
+    from src import experiment
+
+    def corrupt_then_verify(path, sample, **kwargs):
+        Path(path).write_bytes(b"corrupted")
+        return experiment.verify_saved_artifact(path, sample, **kwargs)
+
+    monkeypatch.setattr(main, "verify_saved_artifact", corrupt_then_verify)
+    with pytest.raises(experiment.ArtifactVerificationError):
+        main.main(["--baseline", *dirs(tmp_path)])

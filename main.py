@@ -65,6 +65,7 @@ from src.experiment import (
     load_config,
     make_run_id,
     save_config,
+    verify_saved_artifact,
     versioned_dir,
 )
 from src.feature_engineering import (
@@ -98,6 +99,64 @@ from src.preprocessing import (
 
 ROOT = Path(__file__).resolve().parent
 logger = logging.getLogger("main")
+
+_HANDLER_TAG = "_housing_pipeline_handler"
+
+
+def say(*parts: Any) -> None:
+    """Console output of the command-line program.
+
+    Everything the program reports goes through the ``main`` logger (message-only format on stdout), so it
+    can be silenced with ``--quiet``, redirected, captured in tests, and is also written to ``run.log`` in
+    the run's report folder. Messages from the library modules (``src.*``) appear on stderr with
+    ``--verbose``.
+    """
+    logger.info(" ".join(str(part) for part in parts))
+
+
+def reset_logging() -> None:
+    """Remove (and close) the handlers installed by :func:`configure_logging` / :func:`attach_file_log`."""
+    for target in (logging.getLogger(), logger):
+        for handler in list(target.handlers):
+            if getattr(handler, _HANDLER_TAG, False):
+                target.removeHandler(handler)
+                handler.close()
+
+
+def configure_logging(verbose: bool = False, quiet: bool = False) -> None:
+    """Console logging: program output on stdout (unless ``quiet``) and library messages on stderr."""
+    reset_logging()
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)  # the root level only gates what handlers can see; handlers filter further
+    library = logging.StreamHandler(sys.stderr)
+    library.setLevel(logging.INFO if verbose else logging.WARNING)
+    library.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+    setattr(library, _HANDLER_TAG, True)
+    root.addHandler(library)
+
+    console = logging.StreamHandler(sys.stdout)
+    console.setFormatter(logging.Formatter("%(message)s"))
+    setattr(console, _HANDLER_TAG, True)
+    logger.addHandler(console)
+    logger.setLevel(logging.WARNING if quiet else logging.INFO)
+    logger.propagate = False
+
+
+def attach_file_log(path: Path) -> None:
+    """Also write everything (program output and library INFO messages) to ``path``."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handler = logging.FileHandler(path, mode="w", encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s"))
+    setattr(handler, _HANDLER_TAG, True)
+    logging.getLogger().addHandler(handler)
+    logger.addHandler(handler)
+
+
+def verify_artifact(recorder: RunRecorder, path: Path, sample: Any, method: str, expected: Any) -> None:
+    """Reload a just-saved artifact, run it on ``sample`` and record the outcome (raises if it fails)."""
+    result = verify_saved_artifact(path, sample, method=method, expected=expected)
+    recorder.add_artifact_check(result)
+    say(f"Reload check passed: {path.name} ({method} on {result['n_rows']} rows reproduces the in-memory output)")
 
 
 # --------------------------------------------------------------------------- #
@@ -459,13 +518,13 @@ def run_validation(res: PreprocessedData) -> Tuple[bool, List[Dict[str, Any]]]:
             results.append(fn())
         except Exception as exc:  # noqa: BLE001
             results.append(("Check crashed", False, repr(exc)))
-    print("\nValidation results")
-    print("-" * 78)
+    say("\nValidation results")
+    say("-" * 78)
     for name, passed, detail in results:
-        print(f"[{'PASS' if passed else 'FAIL'}] {name}\n       {detail}")
+        say(f"[{'PASS' if passed else 'FAIL'}] {name}\n       {detail}")
     n_pass = sum(p for _, p, _ in results)
-    print("-" * 78)
-    print(f"{n_pass}/{len(results)} checks passed")
+    say("-" * 78)
+    say(f"{n_pass}/{len(results)} checks passed")
     return n_pass == len(results), [{"check": n, "passed": bool(p), "detail": d} for n, p, d in results]
 
 
@@ -476,6 +535,7 @@ def run_validation(res: PreprocessedData) -> Tuple[bool, List[Dict[str, Any]]]:
 #: do not override the config file or the defaults.
 OVERRIDES: Dict[str, Tuple[str, str]] = {
     "test_size": ("preprocessing", "test_size"),
+    "validation_size": ("preprocessing", "validation_size"),
     "seed": ("preprocessing", "random_state"),
     "scaler": ("preprocessing", "scaler"),
     "outlier_strategy": ("preprocessing", "outlier_strategy"),
@@ -588,11 +648,13 @@ def run_baseline_stage(
         n_splits=settings.cv_folds,
         n_repeats=settings.cv_repeats,
         random_state=cfg.random_state,
+        X_val=res.raw_X_val,
+        y_val=res.y_val,
     )
 
-    print("\n" + "=" * 78)
-    print(f"BASELINE BENCHMARK ({settings.cv_folds}-fold CV x {settings.cv_repeats} repeats on the training set)")
-    print("=" * 78)
+    say("\n" + "=" * 78)
+    say(f"BASELINE BENCHMARK ({settings.cv_folds}-fold CV x {settings.cv_repeats} repeats on the training set)")
+    say("=" * 78)
     cols = [
         "rmse",
         "mae",
@@ -609,33 +671,44 @@ def run_baseline_stage(
         ["mape", "r2", "within_10pct", "skill_vs_mean_%", "rmse_gain_vs_reference_%"]
     ].round(3)
     shown["p_value_vs_reference"] = shown["p_value_vs_reference"].map(lambda p: "" if pd.isna(p) else f"{p:.4f}")
-    print(shown.to_string())
-    print("\nmape and within_10pct are in percent. skill_vs_mean_% = RMSE reduction versus predicting the mean price;")
-    print("rmse_gain_vs_reference_% = RMSE reduction versus the reference (negative = worse); the p-value uses the")
-    print("corrected resampled t-test (cautious: it accounts for overlapping training sets).")
+    say(shown.to_string())
+    say("\nmape and within_10pct are in percent. skill_vs_mean_% = RMSE reduction versus predicting the mean price;")
+    say("rmse_gain_vs_reference_% = RMSE reduction versus the reference (negative = worse); the p-value uses the")
+    say("corrected resampled t-test (cautious: it accounts for overlapping training sets).")
 
-    print("\nHold-out test set (each model evaluated once, after cross-validation):")
+    if result.validation is not None and res.raw_X_val is not None:
+        say(
+            f"\nValidation set ({len(res.raw_X_val)} rows; models fitted on the {len(res.raw_X_train)} training rows). "
+            "Use this or the cross-validation to choose between models, and keep the test set for the end:"
+        )
+        val = result.validation[["rmse", "mae", "mape", "r2", "within_10pct", "bias"]].copy()
+        val[["rmse", "mae", "bias"]] = val[["rmse", "mae", "bias"]].round(0)
+        say(val.round(3).to_string())
+    say("\nHold-out test set (each model evaluated once, after cross-validation):")
     hold = result.holdout[["rmse", "mae", "mape", "r2", "within_10pct", "bias", "rmsle", "fit_seconds"]].copy()
     hold[["rmse", "mae", "bias"]] = hold[["rmse", "mae", "bias"]].round(0)
-    print(hold.round(3).to_string())
+    say(hold.round(3).to_string())
 
     ref = result.reference
-    print(f"\nWhere does the reference baseline ('{ref}') make its errors? (hold-out, residual = prediction - truth)")
-    print(result.residuals["by_price_band"].round(2).to_string())
+    say(f"\nWhere does the reference baseline ('{ref}') make its errors? (hold-out, residual = prediction - truth)")
+    say(result.residuals["by_price_band"].round(2).to_string())
     if "by_group" in result.residuals:
-        print()
-        print(result.residuals["by_group"].round(2).to_string())
+        say()
+        say(result.residuals["by_group"].round(2).to_string())
     trend = result.residuals["error_trend"].iloc[0]
-    print(
+    say(
         f"\nError grows with price: the correlation of absolute error with true price is {trend.iloc[0]:.2f}; "
         f"the most expensive fifth of homes has {trend.iloc[1]:.1f}x the MAE of the cheapest fifth."
     )
 
     if paths is not None:
         written = result.save(paths.reports)
-        BaselineModel(cfg).fit(res.raw_X_train, res.y_train).save(paths.artifacts / "baseline_model.joblib")
-        print(f"\nSaved to {paths.reports}/: {', '.join(p.name for p in written.values())}")
-        print(f"Saved the fitted baseline model to {paths.artifacts}/baseline_model.joblib")
+        baseline_model = BaselineModel(cfg).fit(res.raw_X_train, res.y_train)
+        saved_model = baseline_model.save(paths.artifacts / "baseline_model.joblib")
+        sample = res.raw_X_test.head(5)
+        verify_artifact(recorder, saved_model, sample, "predict", baseline_model.predict(sample))
+        say(f"\nSaved to {paths.reports}/: {', '.join(p.name for p in written.values())}")
+        say(f"Saved the fitted baseline model to {paths.artifacts}/baseline_model.joblib")
     recorder.add("baseline", result.to_dict())
     floor = next(n for n, s in result.specs.items() if s.tier == "floor")
     return {
@@ -687,23 +760,23 @@ def run_feature_stage(
     dropped = [c for c in train_f.columns if c not in selected]
     report = selectors[-1].selection_report_
 
-    print("\n" + "=" * 78)
-    print("FEATURE ENGINEERING AND SELECTION")
-    print("=" * 78)
+    say("\n" + "=" * 78)
+    say("FEATURE ENGINEERING AND SELECTION")
+    say("=" * 78)
     counts = fe.feature_catalog_["group"].value_counts().to_dict()
-    print(
+    say(
         f"Created {len(fe.engineered_features_)} engineered features from "
         f"{res.X_train.shape[1]} preprocessed columns: {counts}"
     )
     kept_eng = [f for f in selected if f in fe.engineered_features_]
-    print(
+    say(
         f"Selection '{settings.selection}' (original features protected) kept {len(selected)} of "
         f"{train_f.shape[1]} columns ({len(kept_eng)} engineered)."
     )
-    print("Dropped:", ", ".join(dropped) if dropped else "nothing")
+    say("Dropped:", ", ".join(dropped) if dropped else "nothing")
     top = report.query("kept").sort_values("score", ascending=False).head(10)
-    print(f"\nTop kept features by the last selector's score ({selectors[-1].method}):")
-    print(top[["score"]].round(4).to_string())
+    say(f"\nTop kept features by the last selector's score ({selectors[-1].method}):")
+    say(top[["score"]].round(4).to_string())
 
     summary = {
         "engineered": len(fe.engineered_features_),
@@ -720,8 +793,11 @@ def run_feature_stage(
         report.to_csv(paths.reports / "feature_selection_report.csv")
         pipeline = make_full_pipeline(LinearRegression(), cfg, settings.feature_engineering, methods)
         pipeline.fit(res.raw_X_train, res.y_train)
-        joblib.dump(pipeline, paths.artifacts / "feature_pipeline.joblib")
-        print(
+        saved_pipeline = paths.artifacts / "feature_pipeline.joblib"
+        joblib.dump(pipeline, saved_pipeline)
+        sample = res.raw_X_test.head(5)
+        verify_artifact(recorder, saved_pipeline, sample, "predict", pipeline.predict(sample))
+        say(
             f"\nSaved engineered data to {paths.processed}/, reports to {paths.reports}/, "
             f"and the fitted end-to-end pipeline to {paths.artifacts}/feature_pipeline.joblib"
         )
@@ -734,12 +810,12 @@ def run_feature_comparison(
     """Compare feature sets by repeated cross-validation on the training data, then test once."""
     cfg = res.config
     scenarios = default_scenarios(settings.feature_engineering)
-    print("\n" + "=" * 78)
-    print(
+    say("\n" + "=" * 78)
+    say(
         f"FEATURE-SET COMPARISON ({settings.cv_folds}-fold CV x {settings.cv_repeats} repeats "
         "on the training set; LinearRegression, log target)"
     )
-    print("=" * 78)
+    say("=" * 78)
     table = evaluate_feature_sets(
         res.raw_X_train,
         res.y_train,
@@ -753,8 +829,8 @@ def run_feature_comparison(
     shown["rmse"], shown["mae"] = shown["rmse"].round(0), shown["mae"].round(0)
     shown[["n_features", "r2", "rmse_gain_%"]] = shown[["n_features", "r2", "rmse_gain_%"]].round(3)
     shown["p_value"] = shown["p_value"].map(lambda p: "" if pd.isna(p) else f"{p:.4f}")
-    print(shown.to_string())
-    print(
+    say(shown.to_string())
+    say(
         "\nrmse_gain_% = RMSE reduction versus the baseline (positive is better); p_value = corrected "
         "resampled t-test (cautious: it accounts for overlapping training sets)."
     )
@@ -762,9 +838,9 @@ def run_feature_comparison(
     baseline = table.attrs["baseline"]
     best = select_best_scenario(table, one_se_rule=True)
     lowest = select_best_scenario(table, one_se_rule=False)
-    print(f"\nLowest mean CV RMSE: '{lowest}'. Simplest scenario within one standard error of it: '{best}'.")
+    say(f"\nLowest mean CV RMSE: '{lowest}'. Simplest scenario within one standard error of it: '{best}'.")
 
-    print("\nHold-out test set (used once, after the choices above; both selection rules are reported):")
+    say("\nHold-out test set (used once, after the choices above; both selection rules are reported):")
     rows = {}
     candidates = [("baseline", baseline), (f"lowest CV RMSE: {lowest}", lowest)]
     if best != lowest:
@@ -780,13 +856,13 @@ def run_feature_comparison(
     holdout["rmse_gain_%"] = (
         100 * (holdout.loc["baseline", "rmse"] - holdout["rmse"]) / holdout.loc["baseline", "rmse"]
     ).round(1)
-    print(holdout.to_string())
+    say(holdout.to_string())
 
     extra: Dict[str, Any] = {}
     if compare_models:
-        print("\n" + "-" * 78)
-        print("DOES FEATURE ENGINEERING HELP OTHER MODELS? (CV on the training set, 1 repeat for the tree models)")
-        print("-" * 78)
+        say("\n" + "-" * 78)
+        say("DOES FEATURE ENGINEERING HELP OTHER MODELS? (CV on the training set, 1 repeat for the tree models)")
+        say("-" * 78)
         compact = {k: scenarios[k] for k in (baseline, "all engineered", "all + vif")}
         for label, model, repeats in (
             ("Ridge(alpha=10)", Ridge(alpha=10), settings.cv_repeats),
@@ -803,8 +879,8 @@ def run_feature_comparison(
                 n_repeats=repeats,
                 random_state=cfg.random_state,
             )
-            print(f"\n{label}:")
-            print(t[["n_features", "rmse", "r2", "rmse_gain_%", "p_value"]].round(3).to_string())
+            say(f"\n{label}:")
+            say(t[["n_features", "rmse", "r2", "rmse_gain_%", "p_value"]].round(3).to_string())
             extra[label] = t.to_dict(orient="index")
 
     recorder.add(
@@ -822,7 +898,7 @@ def run_feature_comparison(
     if paths is not None:
         table.to_csv(paths.reports / "feature_set_comparison.csv")
         holdout.to_csv(paths.reports / "holdout_comparison.csv")
-        print(f"\nSaved comparison tables to {paths.reports}/")
+        say(f"\nSaved comparison tables to {paths.reports}/")
     return {
         "best_scenario": lowest,
         "cv_rmse_best": _num(table.loc[lowest, "rmse"]),
@@ -835,8 +911,9 @@ def run_feature_comparison(
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
-def parse_args(argv=None) -> argparse.Namespace:
-    """Options that map to settings default to ``None`` so that they only override a config file when given."""
+def build_parser() -> argparse.ArgumentParser:
+    """The command-line parser. Options that map to settings default to ``None`` so that they only override a
+    config file when given."""
     p = argparse.ArgumentParser(description="Housing-price preprocessing, feature engineering and evaluation pipeline")
     p.add_argument("--config", type=Path, help="YAML or JSON experiment config (command-line options override it)")
     p.add_argument("--save-config", type=Path, metavar="PATH", help="write the resolved configuration to PATH and exit")
@@ -850,6 +927,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     p.add_argument("--profile", action="store_true", help="also track peak Python memory per stage (slower)")
     p.add_argument("--test-size", type=float, default=None)
+    p.add_argument(
+        "--validation-size",
+        type=float,
+        default=None,
+        help="share of all rows held out as a validation set (0.1 with --test-size 0.2 gives 70/10/20); 0 = none",
+    )
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--scaler", choices=["standard", "robust", "minmax", "none"], default=None)
     p.add_argument("--outlier-strategy", choices=["clip", "none"], default=None)
@@ -907,18 +990,35 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--cv-repeats", type=int, default=None)
     p.add_argument("--validate", action="store_true", help="run the validation suite and a baseline model")
     p.add_argument("--no-save", action="store_true", help="do not write any files")
-    p.add_argument("-v", "--verbose", action="store_true")
-    return p.parse_args(argv)
+    p.add_argument("-v", "--verbose", action="store_true", help="also show INFO messages from the library modules")
+    p.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="only warnings and errors (the run record and files are still written)",
+    )
+    return p
+
+
+def parse_args(argv=None) -> argparse.Namespace:
+    return build_parser().parse_args(argv)
 
 
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     args = parse_args(argv)
-    logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING, format="%(levelname)s: %(message)s")
+    configure_logging(args.verbose, args.quiet)
+    try:
+        return _run(args, argv)
+    finally:
+        reset_logging()
+
+
+def _run(args: argparse.Namespace, argv: List[str]) -> int:
     settings = resolve_settings(args)
     resolved = settings.as_config()
     if args.save_config:
-        print(f"Wrote resolved configuration to {save_config(resolved, args.save_config)}")
+        say(f"Wrote resolved configuration to {save_config(resolved, args.save_config)}")
         return 0
 
     cfg = settings.preprocessing
@@ -928,39 +1028,41 @@ def main(argv=None) -> int:
     recorder = RunRecorder(run_id, resolved, argv)
     profiler = StageProfiler(track_memory=args.profile)
     paths = None if args.no_save else RunPaths.create(args, run_id)
-    print(f"Run ID: {run_id}")
+    if paths is not None:
+        attach_file_log(paths.reports / "run.log")
+    say(f"Run ID: {run_id}")
 
     with profiler.stage("load data"):
         raw = load_data(settings.data)
     recorder.set_data(settings.data, raw)
-    print(f"Loaded {raw.shape[0]} rows x {raw.shape[1]} columns")
-    print("\nMissing values in raw data:")
+    say(f"Loaded {raw.shape[0]} rows x {raw.shape[1]} columns")
+    say("\nMissing values in raw data:")
     missing = missing_value_report(raw).query("missing > 0")
-    print(missing.to_string() if not missing.empty else "  none")
+    say(missing.to_string() if not missing.empty else "  none")
 
     with profiler.stage("preprocessing"):
         res = run_preprocessing(raw, cfg)
-    print("\nCleaning report:", res.cleaning_report)
-    print(f"Train: {res.X_train.shape}, Test: {res.X_test.shape}")
-    print("\nOutput features:", ", ".join(res.X_train.columns))
+    say("\nCleaning report:", res.cleaning_report)
+    say(f"Train: {res.X_train.shape}, Test: {res.X_test.shape}")
+    say("\nOutput features:", ", ".join(res.X_train.columns))
     pre = res.preprocessor
-    print("\nImputation report (training data):")
-    print(pre.imputation_report_.to_string())
+    say("\nImputation report (training data):")
+    say(pre.imputation_report_.to_string())
     if not pre.encoding_report_.empty:
-        print("\nCategorical encoding:")
-        print(pre.encoding_report_.to_string())
+        say("\nCategorical encoding:")
+        say(pre.encoding_report_.to_string())
     if cfg.feature_selection != "none":
-        print(f"\nFeature selection ({cfg.feature_selection}) dropped: {pre.dropped_features_ or 'nothing'}")
-    print("\nDistribution of the stratification column across the split:")
+        say(f"\nFeature selection ({cfg.feature_selection}) dropped: {pre.dropped_features_ or 'nothing'}")
+    say("\nDistribution of the stratification column across the split:")
     if "stratify_column" in res.split_report:
-        print(res.split_report["stratify_column"].to_string())
-    print("\nTarget distribution in train and test:")
-    print(res.split_report["target"].to_string())
+        say(res.split_report["stratify_column"].to_string())
+    say("\nTarget distribution in train and test:")
+    say(res.split_report["target"].to_string())
     if not pre.outlier_bounds_.empty:
         table = pre.outlier_bounds_.copy()
         table["train_values_clipped"] = pre.count_clipped(res.raw_X_train)
-        print("\nOutlier fences learned on the training set:")
-        print(table.round(3).to_string())
+        say("\nOutlier fences learned on the training set:")
+        say(table.round(3).to_string())
     recorder.add(
         "preprocessing",
         {
@@ -988,7 +1090,9 @@ def main(argv=None) -> int:
                 paths.processed / "y_test.csv", index_label="row_id"
             )
             saved = pre.save(paths.artifacts / "preprocessor.joblib")
-        print(f"\nSaved processed data to {paths.processed}/ and the fitted preprocessor to {saved}")
+            sample = res.raw_X_test.head(5)
+            verify_artifact(recorder, saved, sample, "transform", res.X_test.head(5))
+        say(f"\nSaved processed data to {paths.processed}/ and the fitted preprocessor to {saved}")
 
     if args.baseline or args.candidates:
         with profiler.stage("baseline benchmark"):
@@ -1015,15 +1119,15 @@ def main(argv=None) -> int:
         summary["validation_passed"] = ok
         exit_code = 0 if ok else 1
 
-    print("\nStage timings" + (" and peak Python memory" if args.profile else "") + ":")
-    print(profiler.table().to_string())
-    print(f"Total: {profiler.total_seconds():.1f}s")
+    say("\nStage timings" + (" and peak Python memory" if args.profile else "") + ":")
+    say(profiler.table().to_string())
+    say(f"Total: {profiler.total_seconds():.1f}s")
 
     if paths is not None:
         save_config(resolved, paths.reports / "config.yaml")
         record_path = recorder.write(paths.reports, profiler)
         registry = recorder.register(paths.reports_base, {**summary, "total_seconds": profiler.total_seconds()})
-        print(
+        say(
             f"Run record: {record_path}\nResolved config (rerun with --config): {paths.reports / 'config.yaml'}"
             f"\nRun registry: {registry}"
         )
