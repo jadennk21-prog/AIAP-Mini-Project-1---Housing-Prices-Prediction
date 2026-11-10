@@ -2,8 +2,9 @@
 
 This repository contains an exploratory analysis of a housing-price dataset (`eda.ipynb`), a
 reusable, leakage-safe preprocessing pipeline built from its findings (`src/preprocessing.py`), a ladder of
-baseline models with an evaluation framework (`src/models.py`, `src/evaluation.py`), and a feature engineering and
-selection module (`src/feature_engineering.py`) that is validated against the baseline. Experiments are configured with version-controlled YAML/JSON files, and every
+baseline models with an evaluation framework (`src/models.py`, `src/evaluation.py`), a feature engineering and
+selection module (`src/feature_engineering.py`) that is validated against the baseline, and two advanced models of different
+architectures (boosted trees and a neural network, `src/advanced_models.py`) compared with the baseline under nested cross-validation. Experiments are configured with version-controlled YAML/JSON files, and every
 run is recorded under its own run ID (`src/experiment.py`). The regression target is `house_sale_price`.
 
 ```
@@ -25,16 +26,18 @@ raw data -> DataPreprocessor -> FeatureEngineer -> FeatureSelector -> model -> m
 ## Quick start
 
 ```bash
-pip install -r requirements.txt          # developed and tested with Python 3.12, scikit-learn 1.8, pandas 3.0
+pip install -r requirements.txt          # developed with Python 3.12; the final checks ran on scikit-learn 1.9, pandas 3.0 (earlier work on scikit-learn 1.8)
 
 python main.py                           # preprocess the data and print what was learned
 python main.py --baseline                # benchmark the baseline models (about 5 seconds)
 python main.py --baseline --validation-size 0.1   # same, with a separate validation set (70% train / 10% validation / 20% test)
+python main.py --advanced --no-tuning   # compare boosted trees and a neural network with the baseline, fixed settings (about 20 seconds)
+python main.py --advanced               # the full protocol: hyperparameters tuned inside every cross-validation fold (about 6 minutes)
 python main.py --features                # add feature engineering + selection and save the results
-python main.py --validate                # run the 17-check validation suite and a baseline model
+python main.py --validate                # run the 18-check validation suite and a baseline model
 python main.py --compare-features        # cross-validated comparison of feature sets (about 3 minutes with --compare-models)
 python main.py --config configs/default.yaml --features   # run from a config file
-python -m pytest                         # run the 311 unit tests
+python -m pytest                         # run the 368 unit tests
 python scripts/verify_clean_checkout.py  # prove the repository is complete: checks, then tests + validation in a clean copy
 python main.py --help                    # every option
 ```
@@ -50,6 +53,9 @@ Each run that saves files writes into a folder named after its **run ID** (for e
 | `--save-config FILE` | write the resolved configuration (defaults + config file + options) and exit |
 | `--baseline` | benchmark the baseline ladder (mean predictor ... preprocessed linear regression) with cross-validation and a hold-out test |
 | `--candidates` | with `--baseline`: also benchmark Ridge, Lasso, Elastic Net, random forest, gradient boosting and the engineered-feature model |
+| `--advanced` | compare the baseline with the two advanced models (boosted trees, neural network) using nested cross-validation, a hold-out test and a detailed analysis |
+| `--advanced-screen` | the model-selection screening of 12 architectures that led to the two advanced models |
+| `--no-tuning`, `--tune-iterations N`, `--inner-folds N`, `--nn-seeds N` | advanced models: skip the hyperparameter search; settings tried per search (12); inner CV folds (3); network seeds averaged (5) |
 | `--features` | engineer and select features after preprocessing |
 | `--selection-method M` | `none, variance, correlation, vif, univariate, lasso, rfe, tree, consensus`; chain with `+` (`vif+rfe`) |
 | `--compare-features` | cross-validated comparison of feature sets, then one check on the test set |
@@ -72,8 +78,8 @@ Each run that saves files writes into a folder named after its **run ID** (for e
 | Folder | Content (per run, inside `<folder>/<run_id>/`) |
 |---|---|
 | `processed/` | `X_train.csv`, `X_test.csv`, `y_train.csv`, `y_test.csv`; with `--features` also `features_X_train.csv`, `features_X_test.csv` |
-| `artifacts/` | `preprocessor.joblib`; with `--baseline` also `baseline_model.joblib`; with `--features` also `feature_pipeline.joblib` (fitted end-to-end pipeline) |
-| `reports/` | `results.json` (full run record, including the reload checks), `run.log` (everything the run printed and logged), `config.yaml` (resolved config), `feature_catalog.csv`, `feature_selection_report.csv`; with `--baseline` also `baseline_cv_comparison.csv`, `baseline_holdout_metrics.csv`, `baseline_holdout_predictions.csv`, `baseline_residuals_by_price_band.csv`, `baseline_residuals_by_group.csv`, `baseline_diagnostics.png` (and `baseline_validation_metrics.csv` with `--validation-size`); with `--compare-features` also `feature_set_comparison.csv`, `holdout_comparison.csv` |
+| `artifacts/` | `preprocessor.joblib`; with `--baseline` also `baseline_model.joblib`; with `--advanced` also `gradient_boosting_model.joblib` and `neural_network_model.joblib`; with `--features` also `feature_pipeline.joblib` (fitted end-to-end pipeline) |
+| `reports/` | `results.json` (full run record, including the reload checks), `run.log` (everything the run printed and logged), `config.yaml` (resolved config), `feature_catalog.csv`, `feature_selection_report.csv`; with `--baseline` also `baseline_cv_comparison.csv`, `baseline_holdout_metrics.csv`, `baseline_holdout_predictions.csv`, `baseline_residuals_by_price_band.csv`, `baseline_residuals_by_group.csv`, `baseline_diagnostics.png` (and `baseline_validation_metrics.csv` with `--validation-size`); with `--compare-features` also `feature_set_comparison.csv`, `holdout_comparison.csv`; with `--advanced` also `advanced_cv_comparison.csv`, `advanced_holdout_metrics.csv`, `advanced_holdout_predictions.csv`, `advanced_versus_reference.csv`, `advanced_error_by_price_band.csv`, `advanced_error_by_location.csv`, `advanced_blends.csv`, `advanced_complexity.csv`, `advanced_permutation_importance.csv`, `advanced_tuning.csv`, `advanced_comparison.png` (and `advanced_screening.csv` with `--advanced-screen`) |
 | `reports/runs.csv` | one line per run (run ID, config hash, command, key results) to list and compare runs |
 | `<folder>/latest.txt` | the ID of the newest run in that folder |
 
@@ -98,23 +104,27 @@ your-repo-name/
 │   └── example_advanced.yaml     # KNN / per-column imputation, auto encoding, chained selection
 ├── examples/
 │   └── compare_encoders.py       # encoder comparison on synthetic high-cardinality data
+├── results/
+│   └── advanced/                 # outputs of the full advanced run: tables, figure, screening, resolved config
 ├── scripts/
 │   └── verify_clean_checkout.py  # completeness checks + tests and validation in a clean copy; builds the submission zip
 ├── src/
 │   ├── __init__.py
 │   ├── preprocessing.py          # cleaning, imputation, outliers, scaling, encoding
 │   ├── models.py                 # baseline ladder, BaselineModel, candidate models, benchmark harness
+│   ├── advanced_models.py        # boosted trees, neural network, nested tuning, comparison analysis
 │   ├── evaluation.py             # metrics, residual diagnostics, cross-validation, model comparison test
 │   ├── feature_engineering.py    # feature creation, feature selection, feature-set evaluation
 │   └── experiment.py             # config files, run IDs, profiling, run records
 └── tests/
     ├── conftest.py               # shared fixtures (small synthetic dataset)
-    ├── test_preprocessing.py     # 109 tests
+    ├── test_preprocessing.py     # 111 tests
     ├── test_feature_engineering.py   # 68 tests
     ├── test_evaluation.py        # 27 tests (metrics, residual report, CV, corrected t-test)
-    ├── test_models.py            # 30 tests (baseline estimators, ladder, benchmark, validation set)
+    ├── test_models.py            # 32 tests (baseline estimators, ladder, benchmark, validation set, no test set)
+    ├── test_advanced_models.py   # 41 tests (seed averaging, nested tuning, builders, analysis)
     ├── test_experiment.py        # 28 tests (config files, run IDs, profiling, reload verification)
-    ├── test_main.py              # 31 tests (command line, logging, versioned outputs, reload checks)
+    ├── test_main.py              # 43 tests (command line, logging, versioned outputs, reload checks, advanced run, portable configs)
     └── test_repository_integrity.py   # 18 tests (completeness, imports, README matches the code)
 ```
 
@@ -176,9 +186,9 @@ documented), the test counts shown here equal the real test counts, and this REA
 
 ## Configuration files
 
-An experiment is described by a YAML or JSON file with up to five sections: `run`, `preprocessing`
+An experiment is described by a YAML or JSON file with up to six sections: `run`, `preprocessing`
 (every field of `PreprocessingConfig`), `feature_engineering` (every field of `FeatureEngineeringConfig`),
-`selection` and `cv`. Missing settings use the defaults, and **unknown keys are rejected** so typos are caught
+`selection`, `cv` and `advanced` (`tune`, `tune_iterations`, `inner_folds`, `nn_seeds`). Missing settings use the defaults, and **unknown keys are rejected** so typos are caught
 immediately. Precedence is *defaults < config file < command-line options*.
 
 ```yaml
@@ -535,6 +545,148 @@ roles to column names so the module can be reused on other data. `evaluate_featu
 repeated cross-validation; `select_best_scenario(...)` picks the lowest-RMSE scenario or, with the one-standard-error rule, the
 simplest scenario within one standard error of it.
 
+## Advanced models
+
+### The two models and why these two
+
+The baseline is one linear equation on log(price). The sprint asks for two further models with **distinct architectures**, so they were chosen by a
+**screening** of architecture families rather than by name: every candidate gets the baseline's preprocessing and log target, the same folds and the
+same metrics, with fixed untuned settings, cross-validated on the 800 training rows only (`python main.py --advanced-screen`). The screening never even predicts the test set (the benchmark runs without one, which is tested), so it cannot influence the choice.
+
+| Architecture (screening, 5-fold CV x 3, untuned) | CV RMSE | CV R2 | vs linear | p-value |
+|---|---|---|---|---|
+| mean price (floor) | 127,173 | -0.004 | | |
+| linear regression (the baseline model) | 25,149 | 0.960 | | |
+| ridge | 26,335 | 0.956 | 4.7% worse | 0.003 |
+| **neural network, 2 layers (64, 32)** | **21,791** | **0.970** | **13.4% better** | 0.033 |
+| neural network, 1 layer (32) | 24,464 | 0.962 | 2.7% better | 0.53 |
+| kernel ridge (RBF) | 22,317 | 0.968 | 11.3% better | 0.13 |
+| support vector regression (RBF) | 27,918 | 0.951 | 11.0% worse | 0.36 |
+| **gradient boosting (500 trees)** | **28,421** | 0.949 | 13.0% worse | 0.047 |
+| gradient boosting (defaults) | 32,775 | 0.932 | 30.3% worse | 0.005 |
+| histogram gradient boosting | 35,622 | 0.921 | 41.6% worse | < 0.001 |
+| extra trees | 42,230 | 0.889 | 67.9% worse | < 0.001 |
+| random forest | 45,584 | 0.870 | 81.3% worse | < 0.001 |
+| k-nearest neighbours | 45,415 | 0.872 | 80.6% worse | < 0.001 |
+
+- **Boosted trees** represent the tree family: a sequence of hundreds of shallow decision trees, each correcting the previous ones. They were the best tree-based model by a wide margin.
+- **A neural network** (a feed-forward multi-layer perceptron) represents the smooth, flexible non-tree family. It was the best non-tree model. Kernel ridge came close and is statistically
+  indistinguishable from the network (it is a sensible candidate for future work); the network was chosen because it was nominally best, can be tuned over depth and width, and scales better.
+- Both are genuinely different from the baseline: a fixed linear form (baseline) versus piecewise-constant steps learned from data (trees) versus smooth curves learned from data (network).
+
+### Design of the two models (`src/advanced_models.py`)
+
+| | Gradient boosted trees | Neural network |
+|---|---|---|
+| Implementation | scikit-learn `GradientBoostingRegressor` | scikit-learn `MLPRegressor` (Adam optimiser), no extra dependencies |
+| Inputs | the baseline's preprocessed features (9 columns) | the same |
+| Target | log(price) | log(price), standardised (networks train much better on a centred target) |
+| Tuned by randomized search | trees (200 to 800), learning rate, depth (2 to 4), subsample, minimum leaf size | layers and width (32 to 128x64), L2 penalty, learning rate, activation (ReLU or tanh) |
+| Variance control | `subsample < 1` (stochastic boosting) | **average of 5 networks with different random seeds** (single seeds differed by about 2 to 3% in RMSE; averaging five gave a lower RMSE in the exploratory comparison, though not a statistically significant one, p = 0.24) |
+
+Both models receive exactly the baseline's inputs, so the architecture is the only difference. Engineered features were tested (an exploratory 5-fold x 2 comparison on the training rows, fixed settings) and **made both models worse**
+(network 19,569 to 24,227 RMSE, p = 0.015; boosted trees 26,279 to 28,992, p = 0.054), because they learn their own non-linearity and the extra correlated columns only add overfitting on 800 rows.
+
+### Evaluation protocol: nested cross-validation
+
+- **Tuning cannot peek.** Hyperparameters are chosen by randomized search (12 settings, 3-fold inner cross-validation, scored by price-scale RMSE) on the training rows,
+  and the search runs **inside every outer fold** (nested cross-validation), so the reported scores are not flattered by tuning on the data they are measured on.
+  The preprocessing is refitted in every inner fold as well.
+- **Same folds and metrics as the baseline**, 5-fold x 3 repeats, with the corrected resampled t-test for every difference to the reference.
+- **The test set is used once**: the final models are tuned on the full training set and evaluated on the 200 test homes.
+- Every random choice derives from one seed. The tuned settings of each outer fold are recorded (`advanced_tuning.csv`).
+- The search tries the same 12 candidate settings in every fold (same seed), so "stability" below means consistency of the choice among them.
+
+### Results
+
+The tables, figure, screening and resolved configuration of exactly this run (seed 42) are stored in `results/advanced/`, so the results can be inspected without rerunning it
+(`python main.py --config results/advanced/config.yaml --advanced` repeats it). `python main.py --advanced` (about 6 minutes on one CPU, timings vary with the machine; `--no-tuning` about 20 seconds; `--cv-repeats 1` about 2 minutes). Cross-validated on the training set (nested for the tuned models):
+
+| Model | CV RMSE (std) | CV MAE | CV MAPE | CV R2 | within 10% | RMSE vs baseline | p-value | fit time |
+|---|---|---|---|---|---|---|---|---|
+| baseline: linear + preprocessing | 25,149 (2,733) | 17,250 | 4.90% | 0.960 | 88.6% | | | 0.03 s |
+| linear + engineered features (previous sprint) | 19,151 (1,237) | 13,766 | 4.00% | 0.977 | 95.1% | 23.9% better | 0.0002 | 0.07 s |
+| gradient boosted trees | 24,809 (2,462) | 17,572 | 4.99% | 0.961 | 88.8% | 1.4% better | **0.87** | 13.7 s |
+| neural network (5 seeds) | 19,247 (1,243) | 13,980 | 4.08% | 0.977 | 95.2% | 23.5% better | 0.0007 | 7.3 s |
+
+Hold-out test set (200 homes, each model evaluated once):
+
+| Model | RMSE | MAE | MAPE | R2 | within 10% | bias | RMSE vs baseline |
+|---|---|---|---|---|---|---|---|
+| baseline | 29,191 | 19,084 | 5.09% | 0.958 | 88.5% | -1,141 | |
+| linear + engineered features | 19,397 | 13,985 | 3.79% | 0.981 | 96.0% | +438 | 33.6% better |
+| gradient boosted trees | 29,171 | 19,129 | 5.18% | 0.958 | 92.0% | -2,122 | 0.1% better |
+| **neural network** | **18,975** | **13,509** | **3.71%** | **0.982** | **95.5%** | +618 | **35.0% better** |
+
+How reliable are the test-set differences? A bootstrap of the 200 test homes gives, for the RMSE improvement over the baseline: neural network **+10,216** (95% interval 4,145 to 16,552),
+engineered linear +9,794 (4,206 to 15,682), boosted trees **+20 (-3,789 to 4,362, no difference)**. The network has a smaller absolute error than the baseline on 64.5% of the homes, the
+engineered linear model on 65.0%, boosted trees on 50.0%.
+
+### Analysis of the relative performance
+
+**1. The network matches the best hand-crafted model; the trees do not beat the baseline.**
+The neural network and the previous sprint's engineered linear model are **statistically tied** (cross-validated RMSE difference 97 in the linear model's favour, corrected p = 0.81; the network wins in
+one third of the folds but wins on the test set). They reach the same accuracy by different routes: the network learns the curvature and interactions that the linear model needed hand-built features for.
+Boosted trees are significantly worse than the network (p = 0.0002) and indistinguishable from the baseline (p = 0.87). On this smooth, low-dimensional, mostly additive problem (the EDA found
+smooth effects and a log-linear structure) a piecewise-constant model needs many steps to approximate what a line or a smooth curve captures directly, and with only 800 rows it cannot.
+
+**2. Where the gains come from: the expensive homes.** MAE by true-price band on the test set:
+
+| Price band | baseline | linear + engineered | boosted trees | neural network |
+|---|---|---|---|---|
+| Q1 (cheapest fifth) | 13,536 | 9,561 | 14,728 | 10,134 |
+| Q2 | 15,505 | 9,919 | 14,197 | 9,451 |
+| Q3 | 14,264 | 10,710 | 14,138 | 10,448 |
+| Q4 | 16,519 | 15,482 | 16,763 | 14,034 |
+| Q5 (most expensive fifth) | 35,598 | 24,251 | 35,820 | 23,480 |
+
+Mean error as a percentage of price in the most expensive fifth: baseline **-2.4%** (under-predicts), boosted trees -1.5%, linear + engineered +0.1%, network +0.6%. The baseline's shrinkage towards the
+middle (diagnosed in the baseline analysis) is largely removed by the network, while boosted trees keep it. Boosted trees are also the only model with the largest bias in the cheapest band (+3.4%).
+
+**3. By location.** MAE on the test set: Suburban 21,608 (baseline), 14,625 (network), 19,139 (trees); Urban 16,253, 10,460, 15,514; **Rural 17,791, 20,142, 33,539**.
+The network and the engineered linear model help in Suburban and Urban but are slightly *worse than the baseline in Rural*, and boosted trees are much worse there. Only 20 test homes are Rural (and 80 training homes), so this is
+a warning sign, not a finding, but it is the clearest reason not to assume the advanced models are better everywhere.
+
+**4. The models make partly different mistakes.** Correlation of test errors: network and engineered linear 0.91 (nearly the same mistakes), baseline and network 0.66, trees and network 0.76, baseline and trees 0.64. A simple 50/50
+average of the network and the engineered linear model has a test RMSE of 18,728 (against 18,975 for the best single model and 19,397), a small gain that is expected from averaging and was not tuned; the average of the baseline and the network
+(22,021) is worse than the network alone.
+
+**5. All models rely on the same features** (share of permutation importance on the test set): `property_size` 19 to 22%, `proximity_to_public_transport` **20 to 22%**, `crime_rate_in_area` 14 to 15%, then school quality, bathrooms, bedrooms, location and age (6 to 13% each).
+The strong, consistent importance of the transport variable in every architecture confirms that its signal is real (the EDA found it counterintuitive and its meaning is still unconfirmed). Trees and the network use school quality somewhat more than the
+linear model does (13.2% and 10.5% against 8.9%).
+
+**6. Cost.** Complexity, speed and size:
+
+| Model | Parameters | File size | Fit time | Predict time |
+|---|---|---|---|---|
+| baseline | 10 coefficients | 20 KB | 0.03 s | 0.05 ms / home |
+| linear + engineered | 49 coefficients | 43 KB | 0.07 s | 0.10 ms / home |
+| boosted trees | 5,362 tree nodes (800 trees of depth 2) | 595 KB | 16.0 s (includes the search) | 0.07 ms / home |
+| neural network | 48,005 weights (5 networks of 128 x 64) | 1,581 KB | 7.4 s (includes the search) | 0.08 ms / home |
+
+All are fast enough for prediction. The linear models can be read off as coefficients; the other two cannot without extra tools (permutation importance above is a coarse substitute).
+
+**7. Stability of the tuning.** Boosted trees chose the same settings (800 trees, learning rate 0.05, depth 2, subsample 0.6, minimum leaf 5) in 14 of 15 outer folds and for the final model; one fold chose 400 trees with learning rate 0.1. The network chose
+ReLU in every fold, with two settings: 128 x 64 units, L2 0.0008, learning rate 0.001 (10 folds and the final model) or 64 units, L2 0.0038, learning rate 0.01 (5 folds). The inner-CV RMSE was 25,080 to 29,381 for boosted trees and 19,715 to 21,130
+for the network (inner scores are optimistic and use less training data, which is why the outer scores are the ones to quote).
+
+### Which model would I use?
+
+- **Best accuracy with the least manual work:** the neural network. It needs no hand-built features and is the best model by RMSE, MAE and MAPE on the test set.
+- **Equally accurate and far simpler, if the feature code is acceptable:** the engineered linear model (49 readable coefficients, 43 KB, fits in 0.07 s). The cross-validation cannot separate it from the network (it is nominally ahead there: 19,151 against 19,247; the network is ahead on the test set).
+- **Boosted trees:** not competitive here (no better than the baseline, and hundreds of times slower to fit, search included). This does not say trees are bad in general, only that this data is smooth and small.
+- The baseline remains the right reference: every claim above is relative to it.
+
+### Limitations and caveats
+
+- **One dataset, 1,000 rows, one 200-home test set.** Test-set differences have wide uncertainty (see the bootstrap intervals), and a few expensive homes dominate RMSE. The Rural results rest on 20 test homes.
+- **The tuning is modest** (12 of 324 boosted-tree settings, 12 network settings), so these are not the best possible versions of each architecture. More search, other tree libraries (XGBoost, LightGBM) or deeper or wider networks might change the gap, especially for trees.
+  No extra dependency was added.
+- **Nested cross-validation removes tuning optimism from the scores, not selection effects of the screening**, which looked at the training rows with fixed settings. The test set was not used for any decision, but the EDA and the preprocessing design saw all 1,000 rows, as noted before.
+- **The blends and permutation importance use the test set** for insight only; they were not used to choose models.
+- Single-seed neural networks vary by a few percent; the five-seed average reduces that but the result is still one run of a stochastic method.
+- **Not tested:** other feature sets for the advanced models than the baseline's, stacking with a fitted meta-model, calibration of prediction intervals.
+
 ## Using the preprocessing module
 
 ```python
@@ -610,7 +762,7 @@ budget matters. These numbers come from synthetic data and show behaviour, not a
 
 ## Testing and validation
 
-**Unit tests** (`python -m pytest`, 311 tests, about 1 minute) use a small synthetic dataset from `tests/conftest.py`
+**Unit tests** (`python -m pytest`, 368 tests, about 1.5 minutes) use a small synthetic dataset from `tests/conftest.py`
 so they do not depend on the real CSV. They cover:
 
 - configuration validation (invalid values and conflicting column roles are rejected)
@@ -628,6 +780,10 @@ so they do not depend on the real CSV. They cover:
   `n_features`, protection, consensus votes, the "needs y" error, VIF behaviour (including the main-effects regression test) and chained selectors
 - imputation options (per-column, per-group, KNN) and every categorical encoder, including a test that target-encoded training features are cross-fitted
 - configuration: dictionary and YAML/JSON round trips, unknown keys rejected, defaults < file < command line precedence
+- `src/advanced_models.py`: seed averaging (members differ only by seed, reproducible, convergence reported), the tuning wrapper (picks the better setting, `final_params` only for the final refit, deterministic, works inside an outer
+  cross-validation and records its choices), every search parameter existing on its estimator, the network's standardised target, both models on clean and dirty data, the screening catalogue, the analysis functions against hand calculations and
+  known cases (price bands, bootstrap, complexity counts, permutation importance), and the whole comparison on a small problem
+- the advanced command line: settings precedence for the `advanced` section, files, figures, saved models with reload checks, the validation-set variant and the screening
 - the optional validation set: three-way sizes, stratification, disjoint rows, identical test rows with and without it, training-only statistics, the validation table in the benchmark
 - reload verification of saved artifacts: good files, outputs that differ, wrong shapes, missing, corrupt or unusable files, NaN output, and a failing check stopping the run
 - logging: no `print` in `main.py`, `-q` silences the output, no duplicated output or leaked handlers across runs, `run.log` contents, library messages only with `-v`
@@ -644,14 +800,14 @@ so they do not depend on the real CSV. They cover:
   with missing values, and an end-to-end run on deliberately dirty data
 
 To check that the tests are meaningful, bugs were injected on purpose (a clipper that does not clip, a scaler that uses the
-test set's own statistics, a wrong composite formula, an engineered-feature scaler that leaks test statistics, selector protection removed, a wrong-signed bias, a mis-scaled MAPE, a group-mean model without its unseen-category fallback, models evaluated on different folds, cross-validation that trains on the validation rows, leaky target-encoding output, an ignored
+test set's own statistics, a wrong composite formula, an engineered-feature scaler that leaks test statistics, selector protection removed, ensemble members sharing one seed, an ignored final-refit setting, an unstandardised network target, a flipped bootstrap sign, the mean predictor leaking into the analysis, a wrong-signed bias, a mis-scaled MAPE, a group-mean model without its unseen-category fallback, models evaluated on different folds, cross-validation that trains on the validation rows, leaky target-encoding output, an ignored
 per-column imputer override, run-ID collisions, a config file overriding the command line)
 and the suite failed as it should each time.
 
-**Validation script** (`python main.py --validate`) runs 17 checks on the real data and exits with a non-zero status if any fail:
+**Validation script** (`python main.py --validate`) runs 18 checks on the real data and exits with a non-zero status if any fail:
 no NaN/inf in outputs, scaling statistics, leakage, skew reduction, outlier capping, robustness to corrupted data,
 correct imputation report, reversible target transform, save/load, split proportions, cleaning, config validation, an
-end-to-end linear baseline, leak-free and deterministic feature engineering, the engineered + selected pipeline beating the baseline on the test set, evaluation metrics matching hand-computed values, and the baseline ladder being ordered with a mean predictor near R-squared 0. The baseline prints test R-squared of about 0.86 with a raw target and about 0.96 with the log target
+end-to-end linear baseline, leak-free and deterministic feature engineering, the engineered + selected pipeline beating the baseline on the test set, evaluation metrics matching hand-computed values, the baseline ladder being ordered with a mean predictor near R-squared 0, and both advanced models fitting, predicting sensible prices and being reproducible. The baseline prints test R-squared of about 0.86 with a raw target and about 0.96 with the log target
 (plain linear regression, seed 42). It is only a sanity check of the pipeline, not a modelling result.
 
 ## Performance notes and profiling

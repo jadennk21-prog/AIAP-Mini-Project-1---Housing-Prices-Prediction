@@ -20,6 +20,13 @@ Benchmark the baseline models (a ladder from "predict the mean" to the preproces
     python main.py --baseline                    # about 5 seconds
     python main.py --baseline --candidates       # also Ridge, Lasso, trees and the engineered-feature model
 
+Compare the two advanced models (boosted trees, neural network) with the baseline (nested cross-validation)::
+
+    python main.py --advanced --no-tuning        # fixed settings, about 20 seconds
+    python main.py --advanced --cv-repeats 1     # tuned inside every fold, about 2 minutes
+    python main.py --advanced                    # the full protocol (5-fold x 3 repeats), about 6 minutes
+    python main.py --advanced-screen             # the model-selection screening that chose the two architectures
+
 Compare feature sets with cross-validation (training data only) and confirm on the held-out test set::
 
     python main.py --compare-features            # about 2 minutes
@@ -46,7 +53,7 @@ import logging
 import sys
 import tempfile
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -58,6 +65,15 @@ from sklearn.linear_model import LinearRegression, Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import KFold, cross_val_score
 
+from src.advanced_models import (
+    GRADIENT_BOOSTING_NAME,
+    NEURAL_NETWORK_NAME,
+    advanced_specs,
+    analyse_comparison,
+    comparison_specs,
+    plot_comparison,
+    screening_specs,
+)
 from src.experiment import (
     RunRecorder,
     StageProfiler,
@@ -492,6 +508,19 @@ def _check_baseline_ladder(res: PreprocessedData) -> Check:
     )
 
 
+def _check_advanced_models(res: PreprocessedData) -> Check:
+    """Both advanced models must fit, predict sensible prices, and give identical results for the same seed."""
+    cfg = res.config
+    details, ok = [], True
+    for name, spec in advanced_specs(cfg, cfg.random_state, tune=False, n_seeds=2).items():
+        first = spec.build().fit(res.raw_X_train, res.y_train).predict(res.raw_X_test)
+        second = spec.build().fit(res.raw_X_train, res.y_train).predict(res.raw_X_test)
+        r2 = regression_metrics(res.y_test, first)["r2"]
+        ok &= bool(np.isfinite(first).all() and np.array_equal(first, second) and r2 > 0.9)
+        details.append(f"{name.split(' (')[0]}: test R2 {r2:.3f}")
+    return "Advanced models fit, predict sensible prices and are reproducible", ok, "; ".join(details)
+
+
 def run_validation(res: PreprocessedData) -> Tuple[bool, List[Dict[str, Any]]]:
     checks: List[Callable[[], Check]] = [
         lambda: _check_output_quality(res),
@@ -511,6 +540,7 @@ def run_validation(res: PreprocessedData) -> Tuple[bool, List[Dict[str, Any]]]:
         lambda: _check_feature_pipeline(res),
         _check_metrics,
         lambda: _check_baseline_ladder(res),
+        lambda: _check_advanced_models(res),
     ]
     results: List[Check] = []
     for fn in checks:
@@ -551,7 +581,12 @@ OVERRIDES: Dict[str, Tuple[str, str]] = {
     "selection_method": ("selection", "method"),
     "cv_folds": ("cv", "folds"),
     "cv_repeats": ("cv", "repeats"),
+    "tune_iterations": ("advanced", "tune_iterations"),
+    "inner_folds": ("advanced", "inner_folds"),
+    "nn_seeds": ("advanced", "nn_seeds"),
 }
+
+ADVANCED_DEFAULTS: Dict[str, Any] = {"tune": True, "tune_iterations": 12, "inner_folds": 3, "nn_seeds": 5}
 
 
 @dataclass
@@ -564,15 +599,21 @@ class Settings:
     cv_folds: int
     cv_repeats: int
     data: Path
+    advanced: Dict[str, Any] = field(default_factory=lambda: dict(ADVANCED_DEFAULTS))
 
     def as_config(self) -> Dict[str, Any]:
         """The resolved configuration in the same layout a config file uses."""
+        try:
+            shown = self.data.resolve().relative_to(ROOT).as_posix()  # relative paths keep configs portable
+        except ValueError:
+            shown = str(self.data)
         return {
-            "run": {"data": str(self.data)},
+            "run": {"data": shown},
             "preprocessing": self.preprocessing.to_dict(),
             "feature_engineering": self.feature_engineering.to_dict(),
             "selection": {"method": self.selection},
             "cv": {"folds": self.cv_folds, "repeats": self.cv_repeats},
+            "advanced": dict(self.advanced),
         }
 
 
@@ -580,7 +621,8 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
     """Merge defaults, the optional config file and explicit command-line options (in that order)."""
     file_cfg = load_config(args.config) if args.config else {}
     sections: Dict[str, Dict[str, Any]] = {
-        name: dict(file_cfg.get(name) or {}) for name in ("preprocessing", "feature_engineering", "selection", "cv")
+        name: dict(file_cfg.get(name) or {})
+        for name in ("preprocessing", "feature_engineering", "selection", "cv", "advanced")
     }
     for dest, (section, key) in OVERRIDES.items():
         value = getattr(args, dest, None)
@@ -589,6 +631,8 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
         if dest == "clip_z" and value <= 0:
             value = None  # 0 switches winsorising off
         sections[section][key] = value
+    if getattr(args, "no_tuning", None):
+        sections["advanced"]["tune"] = False
 
     data = args.data or (file_cfg.get("run") or {}).get("data") or ROOT / "Housing_Price_Dataset.csv"
     data = Path(data)
@@ -601,6 +645,7 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
         cv_folds=int(sections["cv"].get("folds", 5)),
         cv_repeats=int(sections["cv"].get("repeats", 3)),
         data=data,
+        advanced={**ADVANCED_DEFAULTS, **sections["advanced"]},
     )
 
 
@@ -717,6 +762,233 @@ def run_baseline_stage(
         "baseline_holdout_r2": _num(result.holdout.loc[ref, "r2"]),
         "mean_predictor_holdout_rmse": _num(result.holdout.loc[floor, "rmse"]),
     }
+
+
+# --------------------------------------------------------------------------- #
+# Advanced models
+# --------------------------------------------------------------------------- #
+def run_screening_stage(
+    res: PreprocessedData, settings: Settings, paths: Optional[RunPaths], recorder: RunRecorder
+) -> Dict[str, Any]:
+    """Screen architecture families under identical preprocessing and folds (how the advanced models were chosen)."""
+    cfg = res.config
+    specs = screening_specs(cfg, cfg.random_state)
+    result = run_benchmark(
+        res.raw_X_train,
+        res.y_train,
+        specs=specs,
+        reference="linear regression",
+        n_splits=settings.cv_folds,
+        n_repeats=settings.cv_repeats,
+        random_state=cfg.random_state,
+    )
+    say("\n" + "=" * 78)
+    say(
+        f"MODEL SCREENING ({settings.cv_folds}-fold CV x {settings.cv_repeats} repeats on the training set; "
+        "fixed, untuned settings; all models use the baseline preprocessing and log target)"
+    )
+    say("=" * 78)
+    table = result.comparison[
+        ["rmse", "mae", "mape", "r2", "rmse_gain_vs_reference_%", "p_value_vs_reference", "fit_seconds"]
+    ].copy()
+    table[["rmse", "mae"]] = table[["rmse", "mae"]].round(0)
+    table["p_value_vs_reference"] = table["p_value_vs_reference"].map(lambda p: "" if pd.isna(p) else f"{p:.4f}")
+    say(table.round(3).to_string())
+    say(
+        "\nrmse_gain_vs_reference_% is relative to plain linear regression (positive = better). Settings are NOT "
+        "tuned: "
+        "this is a screening to pick which architectures deserve tuning, not a final ranking."
+    )
+    if paths is not None:
+        result.comparison.to_csv(paths.reports / "advanced_screening.csv")
+        say(f"Saved the screening table to {paths.reports}/advanced_screening.csv")
+    recorder.add("advanced_screening", result.to_dict())
+    best = result.comparison.drop(index=[n for n, s in specs.items() if s.tier == "floor"])["rmse"].idxmin()
+    return {"screening_best": best}
+
+
+SHORT_NAMES = {
+    REFERENCE_BASELINE: "baseline (linear)",
+    "linear regression + engineered features (VIF)": "linear + engineered",
+    GRADIENT_BOOSTING_NAME: "boosted trees",
+    NEURAL_NETWORK_NAME: "neural network",
+}
+
+
+def _short(table: pd.DataFrame) -> pd.DataFrame:
+    """Readable column names for the wide per-model tables."""
+    return table.rename(columns=SHORT_NAMES)
+
+
+def _save_long(tables: Dict[str, pd.DataFrame], path: Path) -> None:
+    pd.concat(tables, names=["model"]).to_csv(path)
+
+
+def run_advanced_stage(
+    res: PreprocessedData, settings: Settings, paths: Optional[RunPaths], recorder: RunRecorder
+) -> Dict[str, Any]:
+    """Compare the baseline with the two advanced models (nested CV, hold-out test) and analyse the differences."""
+    cfg, adv = res.config, settings.advanced
+    specs = comparison_specs(
+        cfg,
+        settings.feature_engineering,
+        cfg.random_state,
+        tune=bool(adv["tune"]),
+        n_iter=int(adv["tune_iterations"]),
+        inner_folds=int(adv["inner_folds"]),
+        n_seeds=int(adv["nn_seeds"]),
+    )
+    mode = (
+        f"tuned inside every fold: {adv['tune_iterations']} settings x {adv['inner_folds']}-fold inner CV"
+        if adv["tune"]
+        else "fixed settings (no tuning)"
+    )
+    say("\n" + "=" * 78)
+    say(f"ADVANCED MODELS ({settings.cv_folds}-fold CV x {settings.cv_repeats} repeats on the training set; {mode})")
+    say("=" * 78)
+    result = run_benchmark(
+        res.raw_X_train,
+        res.y_train,
+        res.raw_X_test,
+        res.y_test,
+        specs,
+        n_splits=settings.cv_folds,
+        n_repeats=settings.cv_repeats,
+        random_state=cfg.random_state,
+        X_val=res.raw_X_val,
+        y_val=res.y_val,
+    )
+    analysis = analyse_comparison(result, res.raw_X_test, res.y_test, random_state=cfg.random_state)
+    ref = result.reference
+    models = [n for n in result.comparison.index if result.specs[n].tier != "floor"]
+
+    cols = [
+        "rmse",
+        "rmse_std",
+        "mae",
+        "mape",
+        "r2",
+        "within_10pct",
+        "rmse_gain_vs_reference_%",
+        "p_value_vs_reference",
+        "fit_seconds",
+    ]
+    shown = result.comparison.loc[models, cols].copy()
+    shown[["rmse", "rmse_std", "mae"]] = shown[["rmse", "rmse_std", "mae"]].round(0)
+    shown["p_value_vs_reference"] = shown["p_value_vs_reference"].map(lambda p: "" if pd.isna(p) else f"{p:.4f}")
+    say("Cross-validation on the training set (nested for the tuned models):")
+    say(shown.round(3).to_string())
+    say(
+        "\nrmse_gain_vs_reference_% = RMSE reduction versus the reference baseline (positive = better); "
+        "the p-value uses the corrected"
+    )
+    say("resampled t-test over identical folds (cautious about overlapping training sets).")
+    if result.validation is not None:
+        n_val = 0 if res.raw_X_val is None else len(res.raw_X_val)
+        say(f"\nValidation set ({n_val} rows; models fitted on the training rows):")
+        say(result.validation.loc[models, ["rmse", "mae", "mape", "r2"]].round(3).to_string())
+    say("\nHold-out test set (each model fitted on the full training set and evaluated once):")
+    hold = result.holdout.loc[models, ["rmse", "mae", "mape", "r2", "within_10pct", "bias"]].copy()
+    hold["rmse_gain_vs_reference_%"] = 100 * (hold.loc[ref, "rmse"] - hold["rmse"]) / hold.loc[ref, "rmse"]
+    hold[["rmse", "mae", "bias"]] = hold[["rmse", "mae", "bias"]].round(0)
+    say(hold.round(3).to_string())
+
+    say("\nHow reliable is the test-set difference to the reference? (bootstrap of the 200 test homes)")
+    say(analysis.versus_reference.round(3).to_string())
+    say(
+        "rmse_difference = RMSE(reference) - RMSE(model): positive means the model is better; "
+        "ci_low / ci_high = 95% interval; "
+        "wins_vs_reference_% = share of homes with a smaller absolute error than the reference."
+    )
+
+    say("\nWhere do the errors differ? Mean absolute error by true-price band (test set):")
+    say(
+        _short(analysis.by_price_band.pivot(index="group", columns="model", values="mae").loc[:, models])
+        .round(0)
+        .to_string()
+    )
+    say("\nMean error as a percentage of price (negative = under-prediction):")
+    say(
+        _short(analysis.by_price_band.pivot(index="group", columns="model", values="bias_pct").loc[:, models])
+        .round(2)
+        .to_string()
+    )
+    if analysis.by_group is not None:
+        say("\nMean absolute error by location (test set):")
+        say(
+            _short(analysis.by_group.pivot(index="group", columns="model", values="mae").loc[:, models])
+            .round(0)
+            .to_string()
+        )
+
+    say("\nComplexity, speed and size:")
+    say(analysis.complexity.round(2).to_string())
+    say("\nShare of permutation importance by raw feature (%, test set):")
+    say(_short(pd.DataFrame({n: t["share_%"] for n, t in analysis.importance.items()})).round(1).to_string())
+    say("\nHyperparameters chosen in every outer fold and for the final model:")
+    if analysis.tuning.empty:
+        say("(no tuning: fixed settings)")
+    else:
+        say(analysis.tuning.dropna(axis=1, how="all").round(4).to_string())
+    blends = analysis.blends
+    say("\nTest RMSE of simple 50/50 averages of two models (insight only, not tuned):")
+    say(blends.assign(blend_rmse=blends["blend_rmse"].round(0)).to_string(index=False))
+
+    significant = [
+        n
+        for n in models
+        if n != ref
+        and result.comparison.loc[n, "p_value_vs_reference"] < 0.05
+        and result.comparison.loc[n, "rmse_gain_vs_reference_%"] > 0
+    ]
+    best = min(models, key=lambda n: result.comparison.loc[n, "rmse"])
+    say(
+        f"\nLowest cross-validated RMSE: '{best}'. Significantly better than the reference "
+        f"(p < 0.05, corrected t-test): "
+        f"{significant if significant else 'none'}."
+    )
+
+    if paths is not None:
+        written = result.save(paths.reports, diagnostics_plot=False, prefix="advanced")
+        analysis.by_price_band.to_csv(paths.reports / "advanced_error_by_price_band.csv", index=False)
+        if analysis.by_group is not None:
+            analysis.by_group.to_csv(paths.reports / "advanced_error_by_location.csv", index=False)
+        analysis.versus_reference.to_csv(paths.reports / "advanced_versus_reference.csv")
+        analysis.blends.to_csv(paths.reports / "advanced_blends.csv", index=False)
+        analysis.complexity.to_csv(paths.reports / "advanced_complexity.csv")
+        analysis.tuning.to_csv(paths.reports / "advanced_tuning.csv", index=False)
+        _save_long(analysis.importance, paths.reports / "advanced_permutation_importance.csv")
+        figure = plot_comparison(
+            result,
+            analysis,
+            paths.reports / "advanced_comparison.png",
+            {
+                GRADIENT_BOOSTING_NAME: "boosted trees",
+                NEURAL_NETWORK_NAME: "neural network",
+                ref: "baseline (linear)",
+                "linear regression + engineered features (VIF)": "linear + engineered",
+            },
+        )
+        sample = res.raw_X_test.head(5)
+        for name, file in (
+            (GRADIENT_BOOSTING_NAME, "gradient_boosting_model.joblib"),
+            (NEURAL_NETWORK_NAME, "neural_network_model.joblib"),
+        ):
+            model = result.fitted[name]
+            target = paths.artifacts / file
+            target.parent.mkdir(parents=True, exist_ok=True)
+            joblib.dump(model, target)
+            verify_artifact(recorder, target, sample, "predict", model.predict(sample))
+        say(
+            f"\nSaved to {paths.reports}/: {', '.join(p.name for p in written.values())}, advanced_*.csv, {figure.name}"
+        )
+    recorder.add("advanced", {"settings": adv, "benchmark": result.to_dict(), "analysis": analysis.to_dict()})
+    summary: Dict[str, Any] = {"advanced_best_model": best, "advanced_mode": "tuned" if adv["tune"] else "fixed"}
+    for label, name in (("gb", GRADIENT_BOOSTING_NAME), ("nn", NEURAL_NETWORK_NAME)):
+        summary[f"{label}_cv_rmse"] = _num(result.cv_table.loc[name, "rmse"])
+        summary[f"{label}_holdout_rmse"] = _num(result.holdout.loc[name, "rmse"])
+    summary["baseline_holdout_rmse"] = _num(result.holdout.loc[ref, "rmse"])
+    return summary
 
 
 # --------------------------------------------------------------------------- #
@@ -967,6 +1239,25 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="with --baseline: also benchmark Ridge, Lasso, trees and engineered features",
     )
+    p.add_argument(
+        "--advanced", action="store_true", help="compare the baseline with boosted trees and a neural network"
+    )
+    p.add_argument(
+        "--advanced-screen", action="store_true", help="screen architecture families (the model-selection step)"
+    )
+    p.add_argument(
+        "--no-tuning",
+        action="store_true",
+        default=None,
+        help="advanced models: fixed settings, no hyperparameter search",
+    )
+    p.add_argument(
+        "--tune-iterations", type=int, default=None, help="advanced models: settings tried per search (default 12)"
+    )
+    p.add_argument(
+        "--inner-folds", type=int, default=None, help="advanced models: inner cross-validation folds (default 3)"
+    )
+    p.add_argument("--nn-seeds", type=int, default=None, help="neural network: random seeds averaged (default 5)")
     p.add_argument("--features", action="store_true", help="engineer and select features after preprocessing")
     p.add_argument(
         "--selection-method",
@@ -1094,6 +1385,12 @@ def _run(args: argparse.Namespace, argv: List[str]) -> int:
             verify_artifact(recorder, saved, sample, "transform", res.X_test.head(5))
         say(f"\nSaved processed data to {paths.processed}/ and the fitted preprocessor to {saved}")
 
+    if args.advanced_screen:
+        with profiler.stage("model screening"):
+            summary.update(run_screening_stage(res, settings, paths, recorder))
+    if args.advanced:
+        with profiler.stage("advanced models"):
+            summary.update(run_advanced_stage(res, settings, paths, recorder))
     if args.baseline or args.candidates:
         with profiler.stage("baseline benchmark"):
             summary.update(run_baseline_stage(res, settings, paths, recorder, args.candidates))
